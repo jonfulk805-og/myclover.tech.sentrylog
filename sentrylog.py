@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MyClover.Tech.SentryLog v2.0 - Log Aggregation & Security Alert Platform
+MyClover.Tech.SentryLog v3.0 - Log Aggregation & Security Alert Platform
 
 A standalone log aggregation and SIEM-lite product from the MyClover.Tech suite.
 Collects syslog from any device, reads Windows Event Logs locally or remotely,
@@ -21,13 +21,22 @@ Features:
   - Dark-themed web dashboard
   - Netmon add-on integration
 
-  Phase 2 (NEW):
+  Phase 2:
   - Windows Event Log collector (local via pywin32)
   - Windows Event Log collector (remote via WinRM / pywinrm)
   - Collects from Security, System, Application, and custom channels
   - Event severity mapping (Windows EventType -> syslog severity)
   - Bookmark tracking to avoid duplicate collection
   - Configurable poll intervals per target
+  - Enterprise tier feature
+
+  Phase 3 (NEW):
+  - Security product API connectors (CrowdStrike, SentinelOne,
+    Microsoft Defender, Sophos Central, Palo Alto Cortex XDR)
+  - Generic inbound webhook receiver for any security tool
+  - Connector management dashboard tab
+  - Per-connector API key storage and test-connectivity
+  - Automatic event normalization into the SentryLog pipeline
   - Enterprise tier feature
 """
 
@@ -85,10 +94,19 @@ try:
 except ImportError:
     pass  # pywinrm not installed -- remote Windows Event Log disabled
 
+# Phase 3: Security API connectors
+HAS_REQUESTS = False
+
+try:
+    import requests as requests_lib
+    HAS_REQUESTS = True
+except ImportError:
+    pass  # requests not installed -- security API connectors disabled
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "sentrylog.db"
 DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
@@ -447,6 +465,40 @@ def init_db():
             error_message TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 3: Security API connectors
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS security_connectors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            connector_type TEXT NOT NULL,
+            api_url TEXT DEFAULT '',
+            api_key TEXT DEFAULT '',
+            api_secret TEXT DEFAULT '',
+            extra_config TEXT DEFAULT '{}',
+            poll_interval_seconds INTEGER DEFAULT 300,
+            enabled INTEGER DEFAULT 1,
+            last_poll TEXT DEFAULT '',
+            last_cursor TEXT DEFAULT '',
+            log_count INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 3: Inbound webhook tokens
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS webhook_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL UNIQUE,
+            label TEXT DEFAULT '',
+            source_name TEXT DEFAULT 'webhook',
+            enabled INTEGER DEFAULT 1,
+            log_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -1414,6 +1466,845 @@ def _start_all_winlog_collectors():
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: Security API Connectors
+# ---------------------------------------------------------------------------
+# Supported connector types
+CONNECTOR_TYPES = {
+    "crowdstrike": "CrowdStrike Falcon",
+    "sentinelone": "SentinelOne",
+    "defender": "Microsoft Defender for Endpoint",
+    "sophos": "Sophos Central",
+    "cortex_xdr": "Palo Alto Cortex XDR",
+    "generic_api": "Generic REST API",
+}
+
+_connector_threads = {}   # connector_id -> threading.Thread
+_connector_stop = {}      # connector_id -> threading.Event
+
+
+def _update_security_connector(connector_id, **kwargs):
+    """Update fields on a security_connectors row."""
+    if not kwargs:
+        return
+    sets = []
+    vals = []
+    for k, v in kwargs.items():
+        sets.append("%s = ?" % k)
+        vals.append(v)
+    vals.append(connector_id)
+    conn = get_db()
+    conn.execute(
+        "UPDATE security_connectors SET %s WHERE id = ?" % ", ".join(sets),
+        vals
+    )
+    conn.commit()
+    conn.close()
+
+
+def _normalize_security_event(event, connector_type, source_name):
+    """Convert a security product event dict into a log dict for ingest_log().
+
+    Each vendor normalizer returns a dict with at minimum:
+      source_ip, source_name, facility, severity, message, program, pid, raw
+    """
+    now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    base = {
+        "timestamp": event.get("timestamp", now_str),
+        "source_ip": event.get("source_ip", "0.0.0.0"),
+        "source_name": source_name,
+        "facility": "security",
+        "severity": event.get("severity", "warning"),
+        "hostname": event.get("hostname", source_name),
+        "program": event.get("program", connector_type),
+        "pid": event.get("pid", ""),
+        "message": event.get("message", str(event)),
+        "raw": event.get("raw", str(event)),
+    }
+    return base
+
+
+# ---------------------------------------------------------------------------
+# CrowdStrike Falcon connector
+# ---------------------------------------------------------------------------
+def _poll_crowdstrike(connector_id, api_url, api_key, api_secret,
+                      extra_config, last_cursor, stop_event):
+    """Poll CrowdStrike Falcon detections via OAuth2 API."""
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    base_url = api_url.rstrip("/") if api_url else "https://api.crowdstrike.com"
+    try:
+        # Authenticate -- OAuth2 client credentials
+        token_resp = requests_lib.post(
+            "%s/oauth2/token" % base_url,
+            data={"client_id": api_key, "client_secret": api_secret},
+            timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json().get("access_token", "")
+        headers = {"Authorization": "Bearer %s" % token}
+
+        # Fetch detection IDs since last cursor
+        params = {"sort": "first_behavior|asc", "limit": 100}
+        if last_cursor:
+            params["filter"] = "first_behavior:>'%s'" % last_cursor
+        det_resp = requests_lib.get(
+            "%s/detects/queries/detects/v1" % base_url,
+            headers=headers, params=params, timeout=30
+        )
+        det_resp.raise_for_status()
+        det_ids = det_resp.json().get("resources", [])
+
+        if not det_ids:
+            _update_security_connector(connector_id, error_message="",
+                                       last_poll=datetime.datetime.utcnow().strftime(
+                                           "%Y-%m-%d %H:%M:%S"))
+            return last_cursor
+
+        # Fetch detection details
+        detail_resp = requests_lib.post(
+            "%s/detects/entities/summaries/GET/v1" % base_url,
+            headers=headers, json={"ids": det_ids}, timeout=30
+        )
+        detail_resp.raise_for_status()
+        detections = detail_resp.json().get("resources", [])
+
+        sev_map = {"1": "info", "2": "notice", "3": "warning",
+                    "4": "error", "5": "critical"}
+        newest_time = last_cursor or ""
+        count = 0
+
+        for det in detections:
+            if stop_event.is_set():
+                break
+            ts = det.get("first_behavior", "")
+            severity_num = str(det.get("max_severity", 3))
+            sev = sev_map.get(severity_num, "warning")
+            desc = det.get("max_severity_displayname", "Detection")
+            device = det.get("device", {})
+            hostname = device.get("hostname", "unknown")
+
+            event = {
+                "timestamp": ts[:19].replace("T", " ") if ts else "",
+                "source_ip": device.get("local_ip", "0.0.0.0"),
+                "hostname": hostname,
+                "severity": sev,
+                "program": "CrowdStrike",
+                "message": "[%s] %s on %s -- %s" % (
+                    desc, det.get("tactic", ""),
+                    hostname, det.get("technique", "")),
+                "raw": json_mod.dumps(det, default=str),
+            }
+            normalized = _normalize_security_event(event, "crowdstrike",
+                                                   "CrowdStrike Falcon")
+            ingest_log(normalized)
+            count += 1
+            if ts and ts > newest_time:
+                newest_time = ts
+
+        _update_security_connector(
+            connector_id, error_message="",
+            log_count=count,
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=newest_time or last_cursor
+        )
+        # Increment count in DB
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return newest_time or last_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] CrowdStrike error: %s", exc)
+        return last_cursor
+
+
+# ---------------------------------------------------------------------------
+# SentinelOne connector
+# ---------------------------------------------------------------------------
+def _poll_sentinelone(connector_id, api_url, api_key, api_secret,
+                      extra_config, last_cursor, stop_event):
+    """Poll SentinelOne threats/alerts via REST API."""
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    base_url = api_url.rstrip("/") if api_url else ""
+    if not base_url:
+        _update_security_connector(connector_id,
+                                   error_message="API URL required (e.g. https://usea1.sentinelone.net)")
+        return last_cursor
+
+    try:
+        headers = {"Authorization": "ApiToken %s" % api_key}
+        params = {"sortBy": "createdAt", "sortOrder": "asc", "limit": 100}
+        if last_cursor:
+            params["cursor"] = last_cursor
+
+        resp = requests_lib.get(
+            "%s/web/api/v2.1/threats" % base_url,
+            headers=headers, params=params, timeout=30
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        threats = body.get("data", [])
+        next_cursor = body.get("pagination", {}).get("nextCursor", "")
+
+        sev_map = {"Low": "notice", "Medium": "warning",
+                    "High": "error", "Critical": "critical"}
+        count = 0
+
+        for threat in threats:
+            if stop_event.is_set():
+                break
+            ti = threat.get("threatInfo", threat)
+            agent = threat.get("agentRealtimeInfo", threat.get("agentDetectionInfo", {}))
+            sev = sev_map.get(ti.get("confidenceLevel", "Medium"), "warning")
+            hostname = agent.get("agentComputerName", "unknown")
+
+            event = {
+                "timestamp": ti.get("createdAt", "")[:19].replace("T", " "),
+                "source_ip": agent.get("agentIpV4", "0.0.0.0"),
+                "hostname": hostname,
+                "severity": sev,
+                "program": "SentinelOne",
+                "message": "[%s] %s on %s -- Classification: %s" % (
+                    ti.get("confidenceLevel", ""),
+                    ti.get("threatName", "Threat"),
+                    hostname,
+                    ti.get("classification", "")),
+                "raw": json_mod.dumps(threat, default=str),
+            }
+            normalized = _normalize_security_event(event, "sentinelone",
+                                                   "SentinelOne")
+            ingest_log(normalized)
+            count += 1
+
+        _update_security_connector(
+            connector_id, error_message="",
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=next_cursor or last_cursor
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return next_cursor or last_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] SentinelOne error: %s", exc)
+        return last_cursor
+
+
+# ---------------------------------------------------------------------------
+# Microsoft Defender for Endpoint connector
+# ---------------------------------------------------------------------------
+def _poll_defender(connector_id, api_url, api_key, api_secret,
+                   extra_config, last_cursor, stop_event):
+    """Poll Microsoft Defender for Endpoint alerts via Graph/MDE API.
+
+    api_key   = client_id (Azure AD app)
+    api_secret = client_secret
+    extra_config should contain {"tenant_id": "..."}
+    """
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    try:
+        cfg = json_mod.loads(extra_config) if isinstance(extra_config, str) else extra_config
+    except Exception:
+        cfg = {}
+
+    tenant_id = cfg.get("tenant_id", "")
+    if not tenant_id:
+        _update_security_connector(connector_id,
+                                   error_message="tenant_id required in extra config")
+        return last_cursor
+
+    try:
+        # Get OAuth2 token
+        token_resp = requests_lib.post(
+            "https://login.microsoftonline.com/%s/oauth2/v2.0/token" % tenant_id,
+            data={
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "scope": "https://api.securitycenter.microsoft.com/.default",
+                "grant_type": "client_credentials",
+            },
+            timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json().get("access_token", "")
+        headers = {"Authorization": "Bearer %s" % token}
+
+        # Fetch alerts
+        url = "https://api.securitycenter.microsoft.com/api/alerts"
+        params = {"$top": 100, "$orderby": "alertCreationTime asc"}
+        if last_cursor:
+            params["$filter"] = "alertCreationTime gt %s" % last_cursor
+
+        resp = requests_lib.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        alerts = resp.json().get("value", [])
+
+        sev_map = {"Informational": "info", "Low": "notice",
+                    "Medium": "warning", "High": "error"}
+        newest_time = last_cursor or ""
+        count = 0
+
+        for alert in alerts:
+            if stop_event.is_set():
+                break
+            ts = alert.get("alertCreationTime", "")
+            sev = sev_map.get(alert.get("severity", "Medium"), "warning")
+            hostname = ""
+            machines = alert.get("machines", [])
+            if machines:
+                hostname = machines[0].get("computerDnsName", "unknown")
+
+            event = {
+                "timestamp": ts[:19].replace("T", " ") if ts else "",
+                "source_ip": "0.0.0.0",
+                "hostname": hostname or "Defender",
+                "severity": sev,
+                "program": "Defender",
+                "message": "[%s] %s -- %s" % (
+                    alert.get("severity", ""),
+                    alert.get("title", "Alert"),
+                    alert.get("description", "")[:200]),
+                "raw": json_mod.dumps(alert, default=str),
+            }
+            normalized = _normalize_security_event(event, "defender",
+                                                   "MS Defender")
+            ingest_log(normalized)
+            count += 1
+            if ts and ts > newest_time:
+                newest_time = ts
+
+        _update_security_connector(
+            connector_id, error_message="",
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=newest_time or last_cursor
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return newest_time or last_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] Defender error: %s", exc)
+        return last_cursor
+
+
+# ---------------------------------------------------------------------------
+# Sophos Central connector
+# ---------------------------------------------------------------------------
+def _poll_sophos(connector_id, api_url, api_key, api_secret,
+                 extra_config, last_cursor, stop_event):
+    """Poll Sophos Central alerts via Partner/Organization API.
+
+    api_key   = client_id
+    api_secret = client_secret
+    extra_config may contain {"tenant_id": "..."} for partner API
+    """
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    try:
+        # Authenticate
+        token_resp = requests_lib.post(
+            "https://id.sophos.com/api/v2/oauth2/token",
+            data={
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "grant_type": "client_credentials",
+                "scope": "token",
+            },
+            timeout=30
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json().get("access_token", "")
+        headers = {"Authorization": "Bearer %s" % token}
+
+        # Get whoami to find data region
+        whoami = requests_lib.get(
+            "https://api.central.sophos.com/whoami/v1",
+            headers=headers, timeout=30
+        )
+        whoami.raise_for_status()
+        whoami_data = whoami.json()
+        data_url = whoami_data.get("apiHosts", {}).get("dataRegion", "")
+        tenant_id = whoami_data.get("id", "")
+
+        if not data_url:
+            _update_security_connector(connector_id,
+                                       error_message="Could not determine Sophos data region")
+            return last_cursor
+
+        headers["X-Tenant-ID"] = tenant_id
+
+        # Fetch alerts
+        params = {"pageSize": 100, "sort": "raisedAt:asc"}
+        if last_cursor:
+            params["pageFromKey"] = last_cursor
+
+        resp = requests_lib.get(
+            "%s/common/v1/alerts" % data_url,
+            headers=headers, params=params, timeout=30
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        alerts = body.get("items", [])
+        next_key = body.get("pages", {}).get("nextKey", "")
+
+        sev_map = {"low": "notice", "medium": "warning",
+                    "high": "error", "critical": "critical"}
+        count = 0
+
+        for alert in alerts:
+            if stop_event.is_set():
+                break
+            ts = alert.get("raisedAt", "")
+            sev = sev_map.get(alert.get("severity", "medium"), "warning")
+
+            event = {
+                "timestamp": ts[:19].replace("T", " ") if ts else "",
+                "source_ip": "0.0.0.0",
+                "hostname": alert.get("managedAgent", {}).get(
+                    "name", "Sophos"),
+                "severity": sev,
+                "program": "Sophos",
+                "message": "[%s] %s -- %s" % (
+                    alert.get("severity", ""),
+                    alert.get("type", "Alert"),
+                    alert.get("description", "")),
+                "raw": json_mod.dumps(alert, default=str),
+            }
+            normalized = _normalize_security_event(event, "sophos",
+                                                   "Sophos Central")
+            ingest_log(normalized)
+            count += 1
+
+        _update_security_connector(
+            connector_id, error_message="",
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=next_key or last_cursor
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return next_key or last_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] Sophos error: %s", exc)
+        return last_cursor
+
+
+# ---------------------------------------------------------------------------
+# Palo Alto Cortex XDR connector
+# ---------------------------------------------------------------------------
+def _poll_cortex_xdr(connector_id, api_url, api_key, api_secret,
+                     extra_config, last_cursor, stop_event):
+    """Poll Palo Alto Cortex XDR incidents via REST API.
+
+    api_url    = FQDN (e.g. https://api-{fqdn}.xdr.us.paloaltonetworks.com)
+    api_key    = API key
+    api_secret = API key ID
+    """
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    base_url = api_url.rstrip("/") if api_url else ""
+    if not base_url:
+        _update_security_connector(connector_id,
+                                   error_message="API URL required")
+        return last_cursor
+
+    try:
+        # Cortex XDR uses API key + API key ID in headers
+        import secrets as secrets_mod
+        nonce = secrets_mod.token_hex(32)
+        ts_ms = str(int(time.time() * 1000))
+
+        # Generate auth headers per Cortex XDR docs
+        auth_string = "%s%s%s" % (api_key, nonce, ts_ms)
+        auth_hash = hashlib.sha256(auth_string.encode("utf-8")).hexdigest()
+
+        headers = {
+            "x-xdr-auth-id": str(api_secret),
+            "x-xdr-nonce": nonce,
+            "x-xdr-timestamp": ts_ms,
+            "Authorization": auth_hash,
+            "Content-Type": "application/json",
+        }
+
+        # Fetch incidents
+        body = {
+            "request_data": {
+                "sort": {"field": "creation_time", "keyword": "asc"},
+                "search_from": 0,
+                "search_to": 100,
+            }
+        }
+        if last_cursor:
+            body["request_data"]["filters"] = [{
+                "field": "creation_time",
+                "operator": "gte",
+                "value": int(last_cursor)
+            }]
+
+        resp = requests_lib.post(
+            "%s/public_api/v1/incidents/get_incidents/" % base_url,
+            headers=headers, json=body, timeout=30
+        )
+        resp.raise_for_status()
+        incidents = resp.json().get("reply", {}).get("incidents", [])
+
+        sev_map = {"informational": "info", "low": "notice",
+                    "medium": "warning", "high": "error",
+                    "critical": "critical"}
+        newest_ts = int(last_cursor) if last_cursor else 0
+        count = 0
+
+        for inc in incidents:
+            if stop_event.is_set():
+                break
+            creation_time = inc.get("creation_time", 0)
+            sev = sev_map.get(
+                inc.get("severity", "medium").lower(), "warning")
+            hosts = inc.get("hosts", ["unknown"])
+            hostname = hosts[0] if hosts else "unknown"
+
+            ts_str = datetime.datetime.utcfromtimestamp(
+                creation_time / 1000.0
+            ).strftime("%Y-%m-%d %H:%M:%S") if creation_time else ""
+
+            event = {
+                "timestamp": ts_str,
+                "source_ip": "0.0.0.0",
+                "hostname": hostname,
+                "severity": sev,
+                "program": "Cortex XDR",
+                "message": "[%s] Incident #%s: %s" % (
+                    inc.get("severity", ""),
+                    inc.get("incident_id", ""),
+                    inc.get("description", "")[:200]),
+                "raw": json_mod.dumps(inc, default=str),
+            }
+            normalized = _normalize_security_event(event, "cortex_xdr",
+                                                   "Cortex XDR")
+            ingest_log(normalized)
+            count += 1
+            if creation_time and creation_time > newest_ts:
+                newest_ts = creation_time
+
+        new_cursor = str(newest_ts) if newest_ts else last_cursor
+        _update_security_connector(
+            connector_id, error_message="",
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=new_cursor
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return new_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] Cortex XDR error: %s", exc)
+        return last_cursor
+
+
+# ---------------------------------------------------------------------------
+# Generic REST API connector
+# ---------------------------------------------------------------------------
+def _poll_generic_api(connector_id, api_url, api_key, api_secret,
+                      extra_config, last_cursor, stop_event):
+    """Poll a generic REST API endpoint for alerts/events.
+
+    api_url    = full URL to GET
+    api_key    = Authorization header value (Bearer token, API key, etc.)
+    extra_config = {"auth_header": "Authorization", "auth_prefix": "Bearer ",
+                    "events_path": "data.alerts", "message_field": "message",
+                    "severity_field": "severity", "timestamp_field": "timestamp",
+                    "cursor_field": "next_cursor"}
+    """
+    if not HAS_REQUESTS:
+        _update_security_connector(connector_id,
+                                   error_message="requests library not installed")
+        return last_cursor
+
+    if not api_url:
+        _update_security_connector(connector_id,
+                                   error_message="API URL required")
+        return last_cursor
+
+    try:
+        cfg = json_mod.loads(extra_config) if isinstance(extra_config, str) else extra_config
+    except Exception:
+        cfg = {}
+
+    auth_header = cfg.get("auth_header", "Authorization")
+    auth_prefix = cfg.get("auth_prefix", "Bearer ")
+    events_path = cfg.get("events_path", "")      # dot-separated, e.g. "data.alerts"
+    msg_field = cfg.get("message_field", "message")
+    sev_field = cfg.get("severity_field", "severity")
+    ts_field = cfg.get("timestamp_field", "timestamp")
+    cursor_field = cfg.get("cursor_field", "")
+
+    try:
+        headers = {}
+        if api_key:
+            headers[auth_header] = "%s%s" % (auth_prefix, api_key)
+
+        params = {}
+        if last_cursor and cursor_field:
+            params["cursor"] = last_cursor
+
+        resp = requests_lib.get(api_url, headers=headers, params=params,
+                                timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+
+        # Navigate to events list via dot path
+        events = body
+        if events_path:
+            for part in events_path.split("."):
+                if isinstance(events, dict):
+                    events = events.get(part, [])
+                else:
+                    events = []
+                    break
+        if not isinstance(events, list):
+            events = [events] if events else []
+
+        # Extract next cursor
+        next_cursor = ""
+        if cursor_field:
+            cursor_val = body
+            for part in cursor_field.split("."):
+                if isinstance(cursor_val, dict):
+                    cursor_val = cursor_val.get(part, "")
+                else:
+                    cursor_val = ""
+                    break
+            next_cursor = str(cursor_val) if cursor_val else ""
+
+        count = 0
+        for evt in events:
+            if stop_event.is_set():
+                break
+            if not isinstance(evt, dict):
+                continue
+
+            event = {
+                "timestamp": str(evt.get(ts_field, ""))[:19].replace("T", " "),
+                "source_ip": evt.get("source_ip", evt.get("ip", "0.0.0.0")),
+                "hostname": evt.get("hostname", evt.get("host", "generic")),
+                "severity": evt.get(sev_field, "warning"),
+                "program": "GenericAPI",
+                "message": str(evt.get(msg_field, str(evt)))[:2000],
+                "raw": json_mod.dumps(evt, default=str),
+            }
+            normalized = _normalize_security_event(event, "generic_api",
+                                                   "Generic API")
+            ingest_log(normalized)
+            count += 1
+
+        _update_security_connector(
+            connector_id, error_message="",
+            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_cursor=next_cursor or last_cursor
+        )
+        conn = get_db()
+        conn.execute(
+            "UPDATE security_connectors SET log_count = log_count + ? WHERE id = ?",
+            (count, connector_id))
+        conn.commit()
+        conn.close()
+        return next_cursor or last_cursor
+
+    except Exception as exc:
+        _update_security_connector(connector_id,
+                                   error_message=str(exc)[:500],
+                                   last_poll=datetime.datetime.utcnow().strftime(
+                                       "%Y-%m-%d %H:%M:%S"))
+        log.error("[Connector] Generic API error: %s", exc)
+        return last_cursor
+
+
+# Dispatcher map: connector_type -> poll function
+_CONNECTOR_POLLERS = {
+    "crowdstrike": _poll_crowdstrike,
+    "sentinelone": _poll_sentinelone,
+    "defender": _poll_defender,
+    "sophos": _poll_sophos,
+    "cortex_xdr": _poll_cortex_xdr,
+    "generic_api": _poll_generic_api,
+}
+
+
+def _connector_poll_loop(connector_id, connector_type, api_url, api_key,
+                         api_secret, extra_config, poll_interval,
+                         stop_event):
+    """Main loop for a security connector thread."""
+    cursor = ""
+    # Load last cursor from DB
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT last_cursor FROM security_connectors WHERE id = ?",
+            (connector_id,)
+        ).fetchone()
+        if row:
+            cursor = row[0] or ""
+        conn.close()
+    except Exception:
+        pass
+
+    poller = _CONNECTOR_POLLERS.get(connector_type)
+    if not poller:
+        _update_security_connector(connector_id,
+                                   error_message="Unknown connector type: %s" % connector_type)
+        return
+
+    log.info("[Connector] Starting %s connector (id=%d, interval=%ds)",
+             connector_type, connector_id, poll_interval)
+
+    while not stop_event.is_set():
+        # Check if still enabled
+        try:
+            conn = get_db()
+            row = conn.execute(
+                "SELECT enabled FROM security_connectors WHERE id = ?",
+                (connector_id,)
+            ).fetchone()
+            conn.close()
+            if not row or not row[0]:
+                log.info("[Connector] Connector %d disabled, stopping",
+                         connector_id)
+                break
+        except Exception:
+            break
+
+        try:
+            cursor = poller(connector_id, api_url, api_key, api_secret,
+                            extra_config, cursor, stop_event)
+        except Exception as exc:
+            log.error("[Connector] %s poll error: %s", connector_type, exc)
+            _update_security_connector(connector_id,
+                                       error_message=str(exc)[:500])
+
+        stop_event.wait(poll_interval)
+
+    log.info("[Connector] Stopped %s connector (id=%d)",
+             connector_type, connector_id)
+
+
+def start_security_connector(connector):
+    """Start a security connector polling thread."""
+    cid = connector["id"]
+    if cid in _connector_threads and _connector_threads[cid].is_alive():
+        return  # Already running
+
+    stop_event = threading.Event()
+    _connector_stop[cid] = stop_event
+
+    t = threading.Thread(
+        target=_connector_poll_loop,
+        args=(cid, connector["connector_type"], connector["api_url"],
+              connector["api_key"], connector["api_secret"],
+              connector["extra_config"], connector["poll_interval_seconds"],
+              stop_event),
+        daemon=True,
+        name="connector-%d-%s" % (cid, connector["connector_type"])
+    )
+    t.start()
+    _connector_threads[cid] = t
+    log.info("[Connector] Started thread for connector %d (%s)",
+             cid, connector["connector_type"])
+
+
+def stop_security_connector(connector_id):
+    """Stop a running security connector."""
+    if connector_id in _connector_stop:
+        _connector_stop[connector_id].set()
+    if connector_id in _connector_threads:
+        _connector_threads[connector_id].join(timeout=5)
+        del _connector_threads[connector_id]
+    if connector_id in _connector_stop:
+        del _connector_stop[connector_id]
+
+
+def _start_all_security_connectors():
+    """Start all enabled security connectors on application boot."""
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, name, connector_type, api_url, api_key, api_secret, "
+            "extra_config, poll_interval_seconds, enabled "
+            "FROM security_connectors WHERE enabled = 1"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return
+
+    for row in rows:
+        connector = {
+            "id": row[0], "name": row[1], "connector_type": row[2],
+            "api_url": row[3], "api_key": row[4], "api_secret": row[5],
+            "extra_config": row[6], "poll_interval_seconds": row[7],
+            "enabled": row[8],
+        }
+        start_security_connector(connector)
+
+    if rows:
+        log.info("[Connector] Started %d security connector(s)", len(rows))
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 def get_stats(hours=24):
@@ -2061,6 +2952,399 @@ if HAS_FLASK:
             "pywinrm_available": HAS_WINRM,
         })
 
+    # ---- Phase 3: Security Connector endpoints (Enterprise) ----
+
+    @app.route("/api/security/connectors")
+    @require_tier(TIER_ENT)
+    def api_list_security_connectors():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, name, connector_type, api_url, api_key, api_secret, "
+            "extra_config, poll_interval_seconds, enabled, last_poll, "
+            "last_cursor, log_count, error_message, created_at, updated_at "
+            "FROM security_connectors ORDER BY id"
+        ).fetchall()
+        conn.close()
+        connectors = []
+        for r in rows:
+            cid = r[0]
+            connectors.append({
+                "id": cid, "name": r[1], "connector_type": r[2],
+                "connector_label": CONNECTOR_TYPES.get(r[2], r[2]),
+                "api_url": r[3],
+                "api_key_set": bool(r[4]),
+                "api_secret_set": bool(r[5]),
+                "extra_config": r[6],
+                "poll_interval_seconds": r[7], "enabled": bool(r[8]),
+                "last_poll": r[9], "last_cursor": r[10],
+                "log_count": r[11], "error_message": r[12],
+                "created_at": r[13], "updated_at": r[14],
+                "collector_running": (cid in _connector_threads
+                                      and _connector_threads[cid].is_alive()),
+            })
+        return jsonify({"connectors": connectors})
+
+    @app.route("/api/security/connectors", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_create_security_connector():
+        data = request.get_json(force=True)
+        name = data.get("name", "").strip()
+        ctype = data.get("connector_type", "").strip()
+        if not name:
+            return jsonify({"error": True, "message": "Name is required."}), 400
+        if ctype not in CONNECTOR_TYPES:
+            return jsonify({"error": True,
+                            "message": "Invalid connector type."}), 400
+
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        extra = data.get("extra_config", "{}")
+        if isinstance(extra, dict):
+            extra = json_mod.dumps(extra)
+
+        conn = get_db()
+        c = conn.execute(
+            "INSERT INTO security_connectors "
+            "(name, connector_type, api_url, api_key, api_secret, extra_config, "
+            " poll_interval_seconds, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, ctype,
+             data.get("api_url", "").strip(),
+             data.get("api_key", "").strip(),
+             data.get("api_secret", "").strip(),
+             extra,
+             int(data.get("poll_interval_seconds", 300)),
+             1 if data.get("enabled", True) else 0,
+             now, now)
+        )
+        new_id = c.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Auto-start if enabled
+        if data.get("enabled", True):
+            connector = {
+                "id": new_id, "name": name, "connector_type": ctype,
+                "api_url": data.get("api_url", ""),
+                "api_key": data.get("api_key", ""),
+                "api_secret": data.get("api_secret", ""),
+                "extra_config": extra,
+                "poll_interval_seconds": int(data.get("poll_interval_seconds", 300)),
+                "enabled": 1,
+            }
+            start_security_connector(connector)
+
+        return jsonify({"id": new_id, "status": "created"})
+
+    @app.route("/api/security/connectors/<int:cid>", methods=["PUT"])
+    @require_tier(TIER_ENT)
+    def api_update_security_connector(cid):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Stop existing collector before update
+        stop_security_connector(cid)
+
+        extra = data.get("extra_config", None)
+        if isinstance(extra, dict):
+            extra = json_mod.dumps(extra)
+
+        conn = get_db()
+        fields = []
+        vals = []
+        for key in ("name", "connector_type", "api_url", "api_key",
+                     "api_secret", "poll_interval_seconds"):
+            if key in data:
+                fields.append("%s = ?" % key)
+                vals.append(data[key])
+        if extra is not None:
+            fields.append("extra_config = ?")
+            vals.append(extra)
+        if "enabled" in data:
+            fields.append("enabled = ?")
+            vals.append(1 if data["enabled"] else 0)
+        fields.append("updated_at = ?")
+        vals.append(now)
+        vals.append(cid)
+
+        if fields:
+            conn.execute(
+                "UPDATE security_connectors SET %s WHERE id = ?" % ", ".join(fields),
+                vals
+            )
+        conn.commit()
+
+        # Restart if enabled
+        row = conn.execute(
+            "SELECT id, name, connector_type, api_url, api_key, api_secret, "
+            "extra_config, poll_interval_seconds, enabled "
+            "FROM security_connectors WHERE id = ?", (cid,)
+        ).fetchone()
+        conn.close()
+
+        if row and row[8]:
+            connector = {
+                "id": row[0], "name": row[1], "connector_type": row[2],
+                "api_url": row[3], "api_key": row[4], "api_secret": row[5],
+                "extra_config": row[6], "poll_interval_seconds": row[7],
+                "enabled": row[8],
+            }
+            start_security_connector(connector)
+
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/security/connectors/<int:cid>", methods=["DELETE"])
+    @require_tier(TIER_ENT)
+    def api_delete_security_connector(cid):
+        stop_security_connector(cid)
+        conn = get_db()
+        conn.execute("DELETE FROM security_connectors WHERE id = ?", (cid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
+    @app.route("/api/security/connectors/<int:cid>/test", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_test_security_connector(cid):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT connector_type, api_url, api_key, api_secret, extra_config "
+            "FROM security_connectors WHERE id = ?", (cid,)
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({"status": "error",
+                            "message": "Connector not found."}), 404
+
+        ctype, api_url, api_key, api_secret, extra_config = row
+
+        if not HAS_REQUESTS:
+            return jsonify({"status": "error",
+                            "message": "requests library not installed. "
+                            "Run: pip install requests"})
+
+        # Attempt a lightweight connectivity check per vendor
+        try:
+            if ctype == "crowdstrike":
+                base = api_url.rstrip("/") if api_url else "https://api.crowdstrike.com"
+                r = requests_lib.post(
+                    "%s/oauth2/token" % base,
+                    data={"client_id": api_key, "client_secret": api_secret},
+                    timeout=15)
+                if r.status_code == 201 or r.status_code == 200:
+                    return jsonify({"status": "ok",
+                                    "message": "CrowdStrike OAuth2 token obtained."})
+                return jsonify({"status": "error",
+                                "message": "Auth failed: HTTP %d" % r.status_code})
+
+            elif ctype == "sentinelone":
+                if not api_url:
+                    return jsonify({"status": "error",
+                                    "message": "API URL required."})
+                r = requests_lib.get(
+                    "%s/web/api/v2.1/system/status" % api_url.rstrip("/"),
+                    headers={"Authorization": "ApiToken %s" % api_key},
+                    timeout=15)
+                if r.ok:
+                    return jsonify({"status": "ok",
+                                    "message": "SentinelOne API reachable."})
+                return jsonify({"status": "error",
+                                "message": "HTTP %d" % r.status_code})
+
+            elif ctype == "defender":
+                cfg = json_mod.loads(extra_config) if extra_config else {}
+                tid = cfg.get("tenant_id", "")
+                if not tid:
+                    return jsonify({"status": "error",
+                                    "message": "tenant_id required in extra config."})
+                r = requests_lib.post(
+                    "https://login.microsoftonline.com/%s/oauth2/v2.0/token" % tid,
+                    data={"client_id": api_key, "client_secret": api_secret,
+                          "scope": "https://api.securitycenter.microsoft.com/.default",
+                          "grant_type": "client_credentials"},
+                    timeout=15)
+                if r.ok:
+                    return jsonify({"status": "ok",
+                                    "message": "Defender token obtained."})
+                return jsonify({"status": "error",
+                                "message": "Auth failed: HTTP %d" % r.status_code})
+
+            elif ctype == "sophos":
+                r = requests_lib.post(
+                    "https://id.sophos.com/api/v2/oauth2/token",
+                    data={"client_id": api_key, "client_secret": api_secret,
+                          "grant_type": "client_credentials", "scope": "token"},
+                    timeout=15)
+                if r.ok:
+                    return jsonify({"status": "ok",
+                                    "message": "Sophos auth successful."})
+                return jsonify({"status": "error",
+                                "message": "Auth failed: HTTP %d" % r.status_code})
+
+            elif ctype == "cortex_xdr":
+                if not api_url:
+                    return jsonify({"status": "error",
+                                    "message": "API URL required."})
+                # Lightweight ping -- list incident-count
+                return jsonify({"status": "ok",
+                                "message": "Cortex XDR URL configured. "
+                                "Full test runs on first poll."})
+
+            elif ctype == "generic_api":
+                if not api_url:
+                    return jsonify({"status": "error",
+                                    "message": "API URL required."})
+                headers = {}
+                if api_key:
+                    cfg = json_mod.loads(extra_config) if extra_config else {}
+                    ah = cfg.get("auth_header", "Authorization")
+                    ap = cfg.get("auth_prefix", "Bearer ")
+                    headers[ah] = "%s%s" % (ap, api_key)
+                r = requests_lib.get(api_url, headers=headers, timeout=15)
+                return jsonify({"status": "ok" if r.ok else "error",
+                                "message": "HTTP %d (%d bytes)" % (
+                                    r.status_code, len(r.content))})
+
+            else:
+                return jsonify({"status": "error",
+                                "message": "Unknown connector type."})
+
+        except Exception as exc:
+            return jsonify({"status": "error",
+                            "message": str(exc)[:500]})
+
+    @app.route("/api/security/connectors/status")
+    @require_tier(TIER_ENT)
+    def api_security_connectors_status():
+        conn = get_db()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM security_connectors"
+        ).fetchone()[0]
+        total_events = conn.execute(
+            "SELECT COALESCE(SUM(log_count), 0) FROM security_connectors"
+        ).fetchone()[0]
+        conn.close()
+
+        running = sum(1 for cid, t in _connector_threads.items()
+                      if t.is_alive())
+
+        return jsonify({
+            "total_connectors": total,
+            "running_connectors": running,
+            "total_events": total_events,
+            "requests_available": HAS_REQUESTS,
+            "supported_types": CONNECTOR_TYPES,
+        })
+
+    # ---- Phase 3: Inbound Webhook endpoint ----
+
+    @app.route("/api/security/webhook/<token>", methods=["POST"])
+    def api_security_webhook(token):
+        """Receive events from any security tool via webhook push.
+        No tier restriction on the webhook itself -- gated by token existence.
+        """
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id, source_name, enabled FROM webhook_tokens WHERE token = ?",
+            (token,)
+        ).fetchone()
+        if not row or not row[2]:
+            conn.close()
+            return jsonify({"error": "Invalid or disabled webhook token."}), 403
+
+        wh_id, source_name, _ = row
+
+        data = request.get_json(silent=True) or {}
+        if isinstance(data, list):
+            events = data
+        elif "events" in data:
+            events = data["events"]
+        elif "alerts" in data:
+            events = data["alerts"]
+        else:
+            events = [data]
+
+        count = 0
+        for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            event = {
+                "timestamp": str(evt.get("timestamp", ""))[:19].replace("T", " "),
+                "source_ip": evt.get("source_ip", evt.get("ip",
+                             request.remote_addr or "0.0.0.0")),
+                "hostname": evt.get("hostname", evt.get("host", source_name)),
+                "severity": evt.get("severity", evt.get("level", "warning")),
+                "program": evt.get("program", evt.get("source", "webhook")),
+                "message": str(evt.get("message", evt.get("description",
+                           str(evt))))[:2000],
+                "raw": json_mod.dumps(evt, default=str),
+            }
+            normalized = _normalize_security_event(event, "webhook",
+                                                   source_name)
+            ingest_log(normalized)
+            count += 1
+
+        conn.execute(
+            "UPDATE webhook_tokens SET log_count = log_count + ? WHERE id = ?",
+            (count, wh_id))
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "ok", "ingested": count})
+
+    @app.route("/api/security/webhooks")
+    @require_tier(TIER_ENT)
+    def api_list_webhooks():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, token, label, source_name, enabled, log_count, created_at "
+            "FROM webhook_tokens ORDER BY id"
+        ).fetchall()
+        conn.close()
+        webhooks = []
+        for r in rows:
+            webhooks.append({
+                "id": r[0], "token": r[1], "label": r[2],
+                "source_name": r[3], "enabled": bool(r[4]),
+                "log_count": r[5], "created_at": r[6],
+            })
+        return jsonify({"webhooks": webhooks})
+
+    @app.route("/api/security/webhooks", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_create_webhook():
+        data = request.get_json(force=True)
+        import secrets as secrets_mod
+        token = data.get("token", "").strip() or secrets_mod.token_urlsafe(32)
+        label = data.get("label", "").strip() or "Webhook"
+        source_name = data.get("source_name", "").strip() or "webhook"
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_db()
+        c = conn.execute(
+            "INSERT INTO webhook_tokens (token, label, source_name, enabled, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (token, label, source_name, now)
+        )
+        new_id = c.lastrowid
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "id": new_id, "token": token,
+            "webhook_url": "/api/security/webhook/%s" % token,
+            "status": "created"
+        })
+
+    @app.route("/api/security/webhooks/<int:wh_id>", methods=["DELETE"])
+    @require_tier(TIER_ENT)
+    def api_delete_webhook(wh_id):
+        conn = get_db()
+        conn.execute("DELETE FROM webhook_tokens WHERE id = ?", (wh_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
     # ---- Test / Utility ----
     @app.route("/api/test-log", methods=["POST"])
     def api_test_log():
@@ -2117,6 +3401,11 @@ def main():
     else:
         print("  [--] pywinrm not found -- remote Windows Event Log disabled")
         print("       Install: pip install pywinrm")
+    if HAS_REQUESTS:
+        print("  [OK] requests detected -- security API connectors enabled")
+    else:
+        print("  [--] requests not found -- security API connectors disabled")
+        print("       Install: pip install requests")
     print()
 
     # Load config
@@ -2168,6 +3457,9 @@ def main():
 
     # Start Windows Event Log collectors (Phase 2)
     _start_all_winlog_collectors()
+
+    # Start Security API connectors (Phase 3)
+    _start_all_security_connectors()
 
     # Start dashboard
     if HAS_FLASK:

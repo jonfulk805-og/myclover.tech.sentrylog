@@ -54,6 +54,13 @@ windows_eventlog:
   # Default poll interval in seconds
   default_poll_interval: 60
 
+# Security API Connectors (Phase 3 - Enterprise tier)
+# Configure connectors in the dashboard UI or via API.
+# Requires: pip install requests
+security_connectors:
+  # Default poll interval for new connectors (seconds)
+  default_poll_interval: 300
+
 # Netmon Integration (add-on mode)
 # When enabled, SentryLog can correlate log sources with netmon devices.
 netmon_integration:

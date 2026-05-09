@@ -1,4 +1,4 @@
-# MyClover.Tech.SentryLog v2.0 - Requirements
+# MyClover.Tech.SentryLog v3.0 - Requirements
 # Core dependencies (required)
 flask>=3.0.0
 pyyaml>=6.0
@@ -8,3 +8,7 @@ pyyaml>=6.0
 #   pip install pywin32
 # Remote Windows Event Log collection (any OS):
 #   pip install pywinrm
+
+# Phase 3: Security API connectors (optional -- install as needed)
+# Required for CrowdStrike, SentinelOne, Defender, Sophos, Cortex XDR, Generic API:
+#   pip install requests
