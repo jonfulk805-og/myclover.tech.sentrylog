@@ -1,4 +1,4 @@
-# MyClover.Tech.SentryLog v3.0 - Requirements
+# MyClover.Tech.SentryLog v4.0 - Requirements
 # Core dependencies (required)
 flask>=3.0.0
 pyyaml>=6.0
@@ -12,3 +12,6 @@ pyyaml>=6.0
 # Phase 3: Security API connectors (optional -- install as needed)
 # Required for CrowdStrike, SentinelOne, Defender, Sophos, Cortex XDR, Generic API:
 #   pip install requests
+
+# Phase 4: Correlation + Compliance (no extra dependencies)
+# Uses built-in threading and SQLite. All features included in core.

@@ -61,6 +61,17 @@ security_connectors:
   # Default poll interval for new connectors (seconds)
   default_poll_interval: 300
 
+# Cross-Source Correlation Engine (Phase 4 - Pro/Enterprise tier)
+# Runs in background, checks every 30 seconds.
+correlation:
+  check_interval_seconds: 30
+  buffer_max_events: 5000
+
+# Compliance Reporting (Phase 4 - Enterprise tier)
+# Templates: pci_dss, hipaa, soc2, nist_csf, cis_controls, custom
+compliance:
+  # Reports are generated on-demand via the dashboard or API
+
 # Netmon Integration (add-on mode)
 # When enabled, SentryLog can correlate log sources with netmon devices.
 netmon_integration:

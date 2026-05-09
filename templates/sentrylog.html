@@ -7,7 +7,7 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 /* ============================================================
-   MyClover.Tech.SentryLog v3.0 Dashboard
+   MyClover.Tech.SentryLog v4.0 Dashboard
    Dark theme matching netmon aesthetic
    ============================================================ */
 :root {
@@ -508,6 +508,8 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <button class="nav-tab" data-tab="alerts" id="alertsTab">Alerts <span class="badge" id="alertBadge" style="display:none">0</span></button>
     <button class="nav-tab" data-tab="winlog">Windows Logs</button>
     <button class="nav-tab" data-tab="connectors">Security Connectors</button>
+    <button class="nav-tab" data-tab="correlation">Correlation</button>
+    <button class="nav-tab" data-tab="compliance">Compliance</button>
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
   <div class="nav-right">
@@ -769,6 +771,101 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     </div>
   </div>
 
+  <!-- ==================== CORRELATION TAB (Phase 4) ==================== -->
+  <div class="tab-panel" id="tab-correlation">
+    <div style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
+      <div>
+        <div class="card-title" style="margin:0">Cross-Source Correlation Engine</div>
+        <div style="font-size:12px; color:var(--text-dim); margin-top:2px">
+          Detect attack patterns spanning multiple log sources and event types
+        </div>
+      </div>
+      <div style="display:flex; gap:8px">
+        <button class="btn" onclick="loadCorrelationTab()">Refresh</button>
+        <button class="btn btn-primary" onclick="openCorrRuleModal()">+ Add Rule</button>
+      </div>
+    </div>
+
+    <!-- Correlation Status Bar -->
+    <div class="card" id="corrStatusBar" style="display:flex; gap:24px; align-items:center; padding:12px 16px; flex-wrap:wrap">
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Rules:</span>
+        <span id="corrStatRules" style="font-weight:600">0</span>
+        <span style="color:var(--text-dim)">(<span id="corrStatEnabled">0</span> enabled)</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Open Incidents:</span>
+        <span id="corrStatOpen" style="font-weight:600; color:var(--orange)">0</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Total Incidents:</span>
+        <span id="corrStatTotal" style="font-weight:600">0</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Buffer:</span>
+        <span id="corrStatBuffer" style="font-weight:600">0</span> <span style="color:var(--text-dim)">events</span>
+      </div>
+    </div>
+
+    <!-- Correlation Rules -->
+    <div style="margin-top:16px">
+      <div class="card-title" style="margin-bottom:8px">Correlation Rules</div>
+      <div id="corrRuleList">
+        <div class="empty">
+          <div class="empty-icon" style="font-size:36px">&#x1F517;</div>
+          <div class="empty-title">No correlation rules defined</div>
+          <div class="empty-desc">Create rules to detect multi-source attack patterns.<br>Requires Pro or Enterprise license.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Correlation Incidents -->
+    <div style="margin-top:24px">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px">
+        <div class="card-title" style="margin:0">Correlation Incidents</div>
+        <div style="display:flex; gap:8px">
+          <select id="corrIncidentFilter" onchange="loadCorrIncidents()" style="padding:4px 8px; border-radius:4px; border:1px solid var(--border); background:var(--card); color:var(--text); font-size:12px">
+            <option value="">All</option>
+            <option value="open">Open</option>
+            <option value="acknowledged">Acknowledged</option>
+            <option value="closed">Closed</option>
+          </select>
+        </div>
+      </div>
+      <div id="corrIncidentList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No correlation incidents yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== COMPLIANCE TAB (Phase 4) ==================== -->
+  <div class="tab-panel" id="tab-compliance">
+    <div style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
+      <div>
+        <div class="card-title" style="margin:0">Compliance Reports</div>
+        <div style="font-size:12px; color:var(--text-dim); margin-top:2px">
+          Generate audit-ready reports for PCI-DSS, HIPAA, SOC 2, NIST CSF, CIS Controls
+        </div>
+      </div>
+      <div style="display:flex; gap:8px">
+        <button class="btn" onclick="loadComplianceTab()">Refresh</button>
+        <button class="btn btn-primary" onclick="openComplianceModal()">+ Generate Report</button>
+      </div>
+    </div>
+
+    <!-- Template cards -->
+    <div id="complianceTemplates" style="display:flex; flex-wrap:wrap; gap:12px; margin-bottom:20px">
+    </div>
+
+    <!-- Report history -->
+    <div>
+      <div class="card-title" style="margin-bottom:8px">Report History</div>
+      <div id="complianceReportList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No reports generated yet.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== SETTINGS TAB ==================== -->
   <div class="tab-panel" id="tab-settings">
     <div class="card">
@@ -836,7 +933,7 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     </div>
 
     <div class="card" style="text-align:center; color:var(--text-dim); font-size:12px">
-      MyClover.Tech.SentryLog v3.0.0 | <a href="https://myclover.tech" target="_blank">myclover.tech</a>
+      MyClover.Tech.SentryLog v4.0.0 | <a href="https://myclover.tech" target="_blank">myclover.tech</a>
     </div>
   </div>
 
@@ -933,6 +1030,105 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <div class="form-actions">
       <button class="btn" onclick="closeTestLogModal()">Cancel</button>
       <button class="btn btn-primary" onclick="sendTestLog()">Send</button>
+    </div>
+  </div>
+</div>
+
+<!-- Correlation Rule Modal -->
+<div class="modal-overlay" id="corrRuleModal">
+  <div class="modal" style="max-width:620px">
+    <h3 id="corrRuleModalTitle">Add Correlation Rule</h3>
+    <input type="hidden" id="corrRuleEditId" value="">
+    <div class="form-group">
+      <label>Rule Name</label>
+      <input type="text" id="corrRuleName" placeholder="e.g. Brute Force + Firewall Alert">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="corrRuleDesc" placeholder="Detect brute force attempts with corresponding firewall blocks">
+    </div>
+    <div class="form-group">
+      <label>Conditions (JSON array)</label>
+      <textarea id="corrRuleConditions" rows="6" placeholder='[
+  {"field": "message", "operator": "contains", "value": "failed auth", "source_filter": "", "severity_filter": ""},
+  {"field": "message", "operator": "contains", "value": "blocked", "source_filter": "firewall", "severity_filter": ""}
+]' style="font-family:Consolas,monospace; font-size:12px"></textarea>
+      <div style="font-size:11px; color:var(--text-dim); margin-top:4px">
+        Operators: <code>contains</code>, <code>equals</code>, <code>regex</code>, <code>not_contains</code>, <code>severity_gte</code>.
+        Fields: <code>message</code>, <code>source_ip</code>, <code>source_name</code>, <code>severity</code>, <code>app_name</code>.
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; flex-wrap:wrap">
+      <div class="form-group" style="flex:1; min-width:140px">
+        <label>Time Window (seconds)</label>
+        <input type="number" id="corrRuleWindow" value="300" min="10" max="86400">
+      </div>
+      <div class="form-group" style="flex:1; min-width:140px">
+        <label>Min Condition Matches</label>
+        <input type="number" id="corrRuleMinMatches" value="2" min="1" max="50">
+      </div>
+    </div>
+    <div style="display:flex; gap:12px; flex-wrap:wrap">
+      <div class="form-group" style="flex:1; min-width:140px">
+        <label>Severity</label>
+        <select id="corrRuleSeverity">
+          <option value="critical">Critical</option>
+          <option value="error">Error</option>
+          <option value="warning">Warning</option>
+          <option value="info">Info</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex:1; min-width:140px">
+        <label>Cooldown (minutes)</label>
+        <input type="number" id="corrRuleCooldown" value="30" min="1" max="1440">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Enabled</label>
+      <select id="corrRuleEnabled">
+        <option value="true">Yes</option>
+        <option value="false">No</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeCorrRuleModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveCorrRule()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Compliance Report Modal -->
+<div class="modal-overlay" id="complianceModal">
+  <div class="modal" style="max-width:500px">
+    <h3>Generate Compliance Report</h3>
+    <div class="form-group">
+      <label>Template</label>
+      <select id="compTemplate">
+        <option value="pci_dss">PCI-DSS Log Review</option>
+        <option value="hipaa">HIPAA Security Audit</option>
+        <option value="soc2">SOC 2 Type II Evidence</option>
+        <option value="nist_csf">NIST Cybersecurity Framework</option>
+        <option value="cis_controls">CIS Controls Audit</option>
+        <option value="custom">Custom Report</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Report Title (optional)</label>
+      <input type="text" id="compTitle" placeholder="Auto-generated from template">
+    </div>
+    <div style="display:flex; gap:12px; flex-wrap:wrap">
+      <div class="form-group" style="flex:1; min-width:160px">
+        <label>Date From</label>
+        <input type="date" id="compDateFrom">
+      </div>
+      <div class="form-group" style="flex:1; min-width:160px">
+        <label>Date To</label>
+        <input type="date" id="compDateTo">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeComplianceModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="generateComplianceReport()">Generate</button>
     </div>
   </div>
 </div>
@@ -1121,6 +1317,8 @@ function switchTab(tab) {
   if (tab === 'alerts') loadAlerts();
   if (tab === 'winlog') loadWinlogTab();
   if (tab === 'connectors') loadConnectorsTab();
+  if (tab === 'correlation') loadCorrelationTab();
+  if (tab === 'compliance') loadComplianceTab();
   if (tab === 'settings') loadSettings();
 }
 
@@ -1994,6 +2192,316 @@ function deleteWebhook(whId) {
   api('/api/security/webhooks/' + whId, { method: 'DELETE' }).then(function() {
     loadWebhooks();
   });
+}
+
+// ------- Correlation (Phase 4) -------
+function loadCorrelationTab() {
+  loadCorrStatus();
+  loadCorrRules();
+  loadCorrIncidents();
+}
+
+function loadCorrStatus() {
+  api('/api/correlation/status').then(function(d) {
+    document.getElementById('corrStatRules').textContent = d.total_rules || 0;
+    document.getElementById('corrStatEnabled').textContent = d.enabled_rules || 0;
+    document.getElementById('corrStatOpen').textContent = d.open_incidents || 0;
+    document.getElementById('corrStatTotal').textContent = d.total_incidents || 0;
+    document.getElementById('corrStatBuffer').textContent = formatNum(d.buffer_size || 0);
+  }).catch(function() {
+    document.getElementById('corrRuleList').innerHTML =
+      '<div class="empty"><div class="empty-icon" style="font-size:36px">&#x1F512;</div>' +
+      '<div class="empty-title">Pro/Enterprise Feature</div>' +
+      '<div class="empty-desc">Correlation engine requires a Pro or Enterprise license.</div></div>';
+  });
+}
+
+function loadCorrRules() {
+  api('/api/correlation/rules').then(function(d) {
+    var el = document.getElementById('corrRuleList');
+    if (!d.rules || d.rules.length === 0) {
+      el.innerHTML =
+        '<div class="empty"><div class="empty-icon" style="font-size:36px">&#x1F517;</div>' +
+        '<div class="empty-title">No correlation rules defined</div>' +
+        '<div class="empty-desc">Create rules to detect multi-source attack patterns.</div></div>';
+      return;
+    }
+    var html = '';
+    d.rules.forEach(function(r) {
+      var conds = [];
+      try { conds = JSON.parse(r.conditions); } catch(e) {}
+      var statusColor = r.enabled ? 'var(--accent)' : 'var(--gray)';
+      html += '<div class="card" style="margin-bottom:10px; padding:14px 16px">';
+      html += '<div style="display:flex; justify-content:space-between; align-items:start; flex-wrap:wrap; gap:8px">';
+      html += '<div style="flex:1; min-width:200px">';
+      html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px">';
+      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';display:inline-block"></span>';
+      html += '<span style="font-weight:600;font-size:14px">' + esc(r.name) + '</span>';
+      html += '<span class="sev-badge sev-' + r.severity + '" style="font-size:10px">' + esc(r.severity) + '</span>';
+      html += '</div>';
+      if (r.description) html += '<div style="font-size:12px;color:var(--text-dim);margin-bottom:4px">' + esc(r.description) + '</div>';
+      html += '<div style="font-size:11px;color:var(--text-dim);display:flex;flex-wrap:wrap;gap:10px">';
+      html += '<span>Conditions: <strong>' + conds.length + '</strong></span>';
+      html += '<span>Min matches: <strong>' + r.min_matches + '</strong></span>';
+      html += '<span>Window: <strong>' + r.time_window_seconds + 's</strong></span>';
+      html += '<span>Cooldown: <strong>' + r.cooldown_minutes + 'm</strong></span>';
+      html += '<span>Fired: <strong>' + r.fire_count + '</strong></span>';
+      if (r.last_fired) html += '<span>Last: ' + esc(r.last_fired) + '</span>';
+      html += '</div></div>';
+      html += '<div style="display:flex;gap:6px">';
+      html += '<button class="btn btn-sm" onclick="editCorrRule(' + r.id + ')">Edit</button>';
+      html += '<button class="btn btn-sm btn-danger" onclick="deleteCorrRule(' + r.id + ')">Delete</button>';
+      html += '</div></div></div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {});
+}
+
+function loadCorrIncidents() {
+  var status = document.getElementById('corrIncidentFilter').value;
+  var url = '/api/correlation/incidents?limit=50';
+  if (status) url += '&status=' + status;
+
+  api(url).then(function(d) {
+    var el = document.getElementById('corrIncidentList');
+    if (!d.incidents || d.incidents.length === 0) {
+      el.innerHTML = '<div class="card" style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No incidents found.</div>';
+      return;
+    }
+    var html = '';
+    d.incidents.forEach(function(inc) {
+      var sevClass = 'sev-' + inc.severity;
+      var statusBadge = inc.status === 'open' ? 'background:var(--orange);color:#fff' :
+                        inc.status === 'acknowledged' ? 'background:var(--blue);color:#fff' :
+                        'background:var(--gray);color:#fff';
+      html += '<div class="card" style="margin-bottom:8px;padding:14px 16px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:8px">';
+      html += '<div style="flex:1;min-width:200px">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+      html += '<span class="sev-badge ' + sevClass + '" style="font-size:10px">' + esc(inc.severity) + '</span>';
+      html += '<span style="font-weight:600">' + esc(inc.rule_name) + '</span>';
+      html += '<span style="font-size:10px;padding:2px 8px;border-radius:10px;' + statusBadge + '">' + esc(inc.status) + '</span>';
+      html += '</div>';
+      html += '<div style="font-size:12px;color:var(--text-dim)">' + esc(inc.summary) + '</div>';
+      html += '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">';
+      html += 'Matched: <strong>' + inc.matched_count + '</strong> conditions | ' + esc(inc.created_at);
+      html += '</div>';
+
+      // Show matched events
+      var evts = [];
+      try { evts = JSON.parse(inc.matched_events); } catch(e) {}
+      if (evts.length > 0) {
+        html += '<div style="margin-top:6px;font-size:11px;background:var(--bg);padding:8px;border-radius:4px;max-height:100px;overflow-y:auto">';
+        evts.forEach(function(e, i) {
+          html += '<div style="margin-bottom:3px"><span style="color:var(--text-dim)">C' + e.condition_index + ':</span> ';
+          html += '<span style="color:var(--accent)">' + esc(e.source_ip || '') + '</span> ';
+          html += esc(e.message || '') + '</div>';
+        });
+        html += '</div>';
+      }
+
+      html += '</div>';
+      html += '<div style="display:flex;gap:6px;flex-direction:column">';
+      if (inc.status === 'open') {
+        html += '<button class="btn btn-sm" onclick="ackCorrIncident(' + inc.id + ')">Acknowledge</button>';
+        html += '<button class="btn btn-sm" onclick="closeCorrIncident(' + inc.id + ')">Close</button>';
+      } else if (inc.status === 'acknowledged') {
+        html += '<button class="btn btn-sm" onclick="closeCorrIncident(' + inc.id + ')">Close</button>';
+      }
+      html += '</div></div></div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {});
+}
+
+function openCorrRuleModal(rule) {
+  document.getElementById('corrRuleEditId').value = rule ? rule.id : '';
+  document.getElementById('corrRuleModalTitle').textContent = rule ? 'Edit Correlation Rule' : 'Add Correlation Rule';
+  document.getElementById('corrRuleName').value = rule ? rule.name : '';
+  document.getElementById('corrRuleDesc').value = rule ? (rule.description || '') : '';
+  document.getElementById('corrRuleConditions').value = rule ? (typeof rule.conditions === 'string' ? rule.conditions : JSON.stringify(rule.conditions, null, 2)) : '';
+  document.getElementById('corrRuleWindow').value = rule ? rule.time_window_seconds : 300;
+  document.getElementById('corrRuleMinMatches').value = rule ? rule.min_matches : 2;
+  document.getElementById('corrRuleSeverity').value = rule ? rule.severity : 'critical';
+  document.getElementById('corrRuleCooldown').value = rule ? rule.cooldown_minutes : 30;
+  document.getElementById('corrRuleEnabled').value = rule ? (rule.enabled ? 'true' : 'false') : 'true';
+  document.getElementById('corrRuleModal').classList.add('active');
+}
+
+function closeCorrRuleModal() {
+  document.getElementById('corrRuleModal').classList.remove('active');
+}
+
+function saveCorrRule() {
+  var id = document.getElementById('corrRuleEditId').value;
+  var condRaw = document.getElementById('corrRuleConditions').value.trim();
+  if (condRaw) {
+    try { JSON.parse(condRaw); } catch(e) { alert('Conditions must be valid JSON array.'); return; }
+  }
+  var data = {
+    name: document.getElementById('corrRuleName').value,
+    description: document.getElementById('corrRuleDesc').value,
+    conditions: condRaw || '[]',
+    time_window_seconds: parseInt(document.getElementById('corrRuleWindow').value) || 300,
+    min_matches: parseInt(document.getElementById('corrRuleMinMatches').value) || 2,
+    severity: document.getElementById('corrRuleSeverity').value,
+    cooldown_minutes: parseInt(document.getElementById('corrRuleCooldown').value) || 30,
+    enabled: document.getElementById('corrRuleEnabled').value === 'true',
+  };
+  if (!data.name) { alert('Name is required.'); return; }
+  var url = id ? '/api/correlation/rules/' + id : '/api/correlation/rules';
+  var method = id ? 'PUT' : 'POST';
+  api(url, { method: method, body: data }).then(function(r) {
+    if (r.error) { alert(r.message || 'Error.'); return; }
+    closeCorrRuleModal();
+    loadCorrelationTab();
+  });
+}
+
+function editCorrRule(rid) {
+  api('/api/correlation/rules').then(function(d) {
+    var rule = (d.rules || []).find(function(r) { return r.id === rid; });
+    if (rule) openCorrRuleModal(rule);
+  });
+}
+
+function deleteCorrRule(rid) {
+  if (!confirm('Delete this correlation rule?')) return;
+  api('/api/correlation/rules/' + rid, { method: 'DELETE' }).then(function() { loadCorrelationTab(); });
+}
+
+function ackCorrIncident(iid) {
+  api('/api/correlation/incidents/' + iid + '/acknowledge', { method: 'POST' }).then(function() { loadCorrelationTab(); });
+}
+
+function closeCorrIncident(iid) {
+  api('/api/correlation/incidents/' + iid + '/close', { method: 'POST' }).then(function() { loadCorrelationTab(); });
+}
+
+// ------- Compliance (Phase 4) -------
+var complianceTemplateInfo = {
+  pci_dss: {name: 'PCI-DSS Log Review', icon: '&#x1F4B3;', desc: 'Payment Card Industry - daily log review, auth failures, privilege escalation'},
+  hipaa: {name: 'HIPAA Security Audit', icon: '&#x1F3E5;', desc: 'Health data - access monitoring, audit trails, incident response'},
+  soc2: {name: 'SOC 2 Type II', icon: '&#x1F6E1;', desc: 'Security monitoring, availability, incident response evidence'},
+  nist_csf: {name: 'NIST CSF', icon: '&#x1F3DB;', desc: 'Identify, Protect, Detect, Respond, Recover assessment'},
+  cis_controls: {name: 'CIS Controls', icon: '&#x2699;', desc: 'Log management and continuous monitoring compliance'},
+  custom: {name: 'Custom Report', icon: '&#x1F4CB;', desc: 'Generate a custom report with selected sections'}
+};
+
+function loadComplianceTab() {
+  loadComplianceTemplates();
+  loadComplianceReports();
+}
+
+function loadComplianceTemplates() {
+  var el = document.getElementById('complianceTemplates');
+  var html = '';
+  for (var key in complianceTemplateInfo) {
+    var t = complianceTemplateInfo[key];
+    html += '<div class="card" style="flex:1;min-width:160px;max-width:220px;padding:16px;cursor:pointer;transition:border-color 0.2s" ';
+    html += 'onclick="openComplianceModalWithTemplate(\'' + key + '\')" ';
+    html += 'onmouseover="this.style.borderColor=\'var(--accent)\'" onmouseout="this.style.borderColor=\'var(--border)\'">';
+    html += '<div style="font-size:24px;margin-bottom:6px">' + t.icon + '</div>';
+    html += '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + t.name + '</div>';
+    html += '<div style="font-size:11px;color:var(--text-dim)">' + t.desc + '</div>';
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function loadComplianceReports() {
+  api('/api/compliance/reports').then(function(d) {
+    var el = document.getElementById('complianceReportList');
+    if (!d.reports || d.reports.length === 0) {
+      el.innerHTML = '<div class="card" style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No reports generated yet. Click a template above or use "+ Generate Report".</div>';
+      return;
+    }
+    var html = '';
+    d.reports.forEach(function(r) {
+      var statusColor = r.status === 'completed' ? 'var(--accent)' :
+                        r.status === 'generating' ? 'var(--orange)' :
+                        r.status === 'failed' ? 'var(--red)' : 'var(--gray)';
+      var tplInfo = complianceTemplateInfo[r.template] || {name: r.template, icon: '&#x1F4CB;'};
+      html += '<div class="card" style="margin-bottom:8px;padding:14px 16px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+      html += '<div style="flex:1;min-width:200px">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+      html += '<span style="font-size:16px">' + tplInfo.icon + '</span>';
+      html += '<span style="font-weight:600">' + esc(r.title || tplInfo.name) + '</span>';
+      html += '<span style="font-size:10px;padding:2px 8px;border-radius:10px;background:' + statusColor + ';color:#fff">' + esc(r.status) + '</span>';
+      html += '</div>';
+      html += '<div style="font-size:12px;color:var(--text-dim)">';
+      html += 'Period: ' + esc(r.date_from) + ' to ' + esc(r.date_to);
+      if (r.generated_at) html += ' | Generated: ' + esc(r.generated_at);
+      html += '</div>';
+      if (r.summary) html += '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">' + esc(r.summary) + '</div>';
+      html += '</div>';
+      html += '<div style="display:flex;gap:6px">';
+      if (r.status === 'completed') {
+        html += '<button class="btn btn-sm btn-primary" onclick="viewComplianceReport(' + r.id + ')">View</button>';
+        html += '<button class="btn btn-sm" onclick="downloadComplianceReport(' + r.id + ')">Download</button>';
+      }
+      html += '<button class="btn btn-sm btn-danger" onclick="deleteComplianceReport(' + r.id + ')">Delete</button>';
+      html += '</div></div></div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {
+    document.getElementById('complianceReportList').innerHTML =
+      '<div class="empty"><div class="empty-icon" style="font-size:36px">&#x1F512;</div>' +
+      '<div class="empty-title">Enterprise Feature</div>' +
+      '<div class="empty-desc">Compliance reporting requires an Enterprise license.</div></div>';
+  });
+}
+
+function openComplianceModal() {
+  var today = new Date();
+  var weekAgo = new Date(today.getTime() - 7*24*60*60*1000);
+  document.getElementById('compTemplate').value = 'pci_dss';
+  document.getElementById('compTitle').value = '';
+  document.getElementById('compDateFrom').value = weekAgo.toISOString().split('T')[0];
+  document.getElementById('compDateTo').value = today.toISOString().split('T')[0];
+  document.getElementById('complianceModal').classList.add('active');
+}
+
+function openComplianceModalWithTemplate(tpl) {
+  openComplianceModal();
+  document.getElementById('compTemplate').value = tpl;
+}
+
+function closeComplianceModal() {
+  document.getElementById('complianceModal').classList.remove('active');
+}
+
+function generateComplianceReport() {
+  var data = {
+    template: document.getElementById('compTemplate').value,
+    title: document.getElementById('compTitle').value,
+    date_from: document.getElementById('compDateFrom').value + ' 00:00:00',
+    date_to: document.getElementById('compDateTo').value + ' 23:59:59',
+  };
+  if (!data.date_from || !data.date_to) { alert('Date range required.'); return; }
+  api('/api/compliance/reports/generate', { method: 'POST', body: data }).then(function(r) {
+    if (r.error) { alert(r.message || 'Error.'); return; }
+    closeComplianceModal();
+    setTimeout(function() { loadComplianceReports(); }, 2000);
+    alert('Report is being generated. It will appear in the list shortly.');
+  });
+}
+
+function viewComplianceReport(rid) {
+  window.open('/api/compliance/reports/' + rid + '/html', '_blank');
+}
+
+function downloadComplianceReport(rid) {
+  var a = document.createElement('a');
+  a.href = '/api/compliance/reports/' + rid + '/html';
+  a.download = 'sentrylog-compliance-report-' + rid + '.html';
+  a.click();
+}
+
+function deleteComplianceReport(rid) {
+  if (!confirm('Delete this compliance report?')) return;
+  api('/api/compliance/reports/' + rid, { method: 'DELETE' }).then(function() { loadComplianceReports(); });
 }
 
 // ------- Settings -------

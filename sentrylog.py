@@ -106,7 +106,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "sentrylog.db"
 DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
@@ -502,6 +502,66 @@ def init_db():
         )
     """)
 
+    # Phase 4: Correlation rules
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS correlation_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            conditions TEXT NOT NULL DEFAULT '[]',
+            time_window_seconds INTEGER DEFAULT 300,
+            min_matches INTEGER DEFAULT 2,
+            severity TEXT DEFAULT 'critical',
+            enabled INTEGER DEFAULT 1,
+            cooldown_minutes INTEGER DEFAULT 30,
+            last_fired TEXT DEFAULT '',
+            fire_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 4: Correlation incidents
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS correlation_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER,
+            rule_name TEXT DEFAULT '',
+            severity TEXT DEFAULT 'critical',
+            matched_events TEXT DEFAULT '[]',
+            matched_count INTEGER DEFAULT 0,
+            summary TEXT DEFAULT '',
+            status TEXT DEFAULT 'open',
+            acknowledged INTEGER DEFAULT 0,
+            ack_by TEXT DEFAULT '',
+            ack_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (rule_id) REFERENCES correlation_rules(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_corr_incidents_created
+        ON correlation_incidents(created_at DESC)
+    """)
+
+    # Phase 4: Compliance reports
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS compliance_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            date_from TEXT NOT NULL,
+            date_to TEXT NOT NULL,
+            parameters TEXT DEFAULT '{}',
+            status TEXT DEFAULT 'pending',
+            html_content TEXT DEFAULT '',
+            summary TEXT DEFAULT '',
+            generated_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     log.info("Database initialized at %s", DB_PATH)
@@ -654,6 +714,9 @@ _BUFFER_FLUSH_INTERVAL = 2  # seconds
 
 def ingest_log(parsed):
     """Add a parsed log entry to the buffer for batch insertion."""
+    # Phase 4: Feed correlation engine
+    _corr_add_event(parsed)
+
     with _log_buffer_lock:
         _log_buffer.append(parsed)
         if len(_log_buffer) >= _BUFFER_FLUSH_SIZE:
@@ -2305,6 +2368,582 @@ def _start_all_security_connectors():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: Cross-Source Correlation Engine
+# ---------------------------------------------------------------------------
+# Condition format in JSON:
+#   [
+#     {"field": "message", "operator": "contains", "value": "failed",
+#      "source_filter": "", "severity_filter": ""},
+#     {"field": "message", "operator": "regex", "value": "brute.?force",
+#      "source_filter": "10.0.0.1", "severity_filter": "critical"}
+#   ]
+# A correlation fires when >= min_matches distinct conditions match
+# within time_window_seconds of each other.
+
+_correlation_lock = threading.Lock()
+_correlation_buffer = []    # recent logs for correlation window
+_CORR_BUFFER_MAX = 5000    # rolling buffer size
+
+def _corr_add_event(log_entry):
+    """Add a log entry to the correlation rolling buffer."""
+    with _correlation_lock:
+        _correlation_buffer.append(log_entry)
+        if len(_correlation_buffer) > _CORR_BUFFER_MAX:
+            del _correlation_buffer[:len(_correlation_buffer) - _CORR_BUFFER_MAX]
+
+
+def _corr_match_condition(entry, condition):
+    """Check if a single log entry matches a correlation condition."""
+    field = condition.get("field", "message")
+    operator = condition.get("operator", "contains")
+    value = condition.get("value", "")
+    src_filter = condition.get("source_filter", "").strip()
+    sev_filter = condition.get("severity_filter", "").strip()
+
+    # Source filter
+    if src_filter:
+        entry_src = "%s %s" % (entry.get("source_ip", ""),
+                               entry.get("source_name", ""))
+        if src_filter.lower() not in entry_src.lower():
+            return False
+
+    # Severity filter
+    if sev_filter:
+        if entry.get("severity", "").lower() != sev_filter.lower():
+            return False
+
+    # Field match
+    field_val = str(entry.get(field, entry.get("message", "")))
+    if operator == "contains":
+        return value.lower() in field_val.lower()
+    elif operator == "equals":
+        return field_val.lower() == value.lower()
+    elif operator == "regex":
+        try:
+            return bool(re.search(value, field_val, re.IGNORECASE))
+        except re.error:
+            return False
+    elif operator == "not_contains":
+        return value.lower() not in field_val.lower()
+    elif operator == "severity_gte":
+        sev_map = {"emergency": 0, "alert": 1, "critical": 2, "error": 3,
+                   "warning": 4, "notice": 5, "info": 6, "debug": 7}
+        entry_sev = sev_map.get(entry.get("severity", "info").lower(), 6)
+        target_sev = sev_map.get(value.lower(), 4)
+        return entry_sev <= target_sev
+    return False
+
+
+def _run_correlation_check():
+    """Evaluate all correlation rules against the rolling buffer.
+    Called periodically from the correlation thread.
+    """
+    tier = get_tier()
+    tier_order = [TIER_FREE, TIER_PRO, TIER_ENT]
+    if tier_order.index(tier) < tier_order.index(TIER_PRO):
+        return
+
+    conn = get_db()
+    rules = conn.execute(
+        "SELECT id, name, conditions, time_window_seconds, min_matches, "
+        "severity, cooldown_minutes, last_fired, fire_count "
+        "FROM correlation_rules WHERE enabled = 1"
+    ).fetchall()
+
+    now = datetime.datetime.utcnow()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    with _correlation_lock:
+        buffer_copy = list(_correlation_buffer)
+
+    for rule in rules:
+        rule_id, rule_name = rule[0], rule[1]
+        try:
+            conditions = json_mod.loads(rule[2])
+        except (json_mod.JSONDecodeError, TypeError):
+            continue
+        time_window = rule[3] or 300
+        min_matches = rule[4] or 2
+        severity = rule[5] or "critical"
+        cooldown = rule[6] or 30
+        last_fired = rule[7] or ""
+        fire_count = rule[8] or 0
+
+        # Cooldown check
+        if last_fired:
+            try:
+                lf = datetime.datetime.strptime(last_fired, "%Y-%m-%d %H:%M:%S")
+                if (now - lf).total_seconds() < cooldown * 60:
+                    continue
+            except ValueError:
+                pass
+
+        # Evaluate conditions against buffer
+        cutoff = now - datetime.timedelta(seconds=time_window)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Only check recent events in window
+        recent = [e for e in buffer_copy
+                  if e.get("received_at", e.get("timestamp", "")) >= cutoff_str]
+        if not recent:
+            continue
+
+        # For each condition, find matching events
+        matched_conditions = {}
+        matched_events = []
+        for ci, cond in enumerate(conditions):
+            for entry in recent:
+                if _corr_match_condition(entry, cond):
+                    matched_conditions[ci] = True
+                    matched_events.append({
+                        "condition_index": ci,
+                        "source_ip": entry.get("source_ip", ""),
+                        "source_name": entry.get("source_name", ""),
+                        "severity": entry.get("severity", ""),
+                        "message": str(entry.get("message", ""))[:200],
+                        "timestamp": entry.get("timestamp",
+                                    entry.get("received_at", "")),
+                    })
+                    break  # one match per condition is enough
+
+        # Fire if enough distinct conditions matched
+        if len(matched_conditions) >= min_matches:
+            summary = ("Correlation rule '%s' fired: %d/%d conditions matched "
+                       "within %ds window" % (
+                           rule_name, len(matched_conditions),
+                           len(conditions), time_window))
+
+            events_json = json_mod.dumps(matched_events[:50], default=str)
+
+            conn.execute(
+                "INSERT INTO correlation_incidents "
+                "(rule_id, rule_name, severity, matched_events, matched_count, "
+                " summary, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
+                (rule_id, rule_name, severity, events_json,
+                 len(matched_conditions), summary, now_str)
+            )
+            conn.execute(
+                "UPDATE correlation_rules SET last_fired = ?, "
+                "fire_count = fire_count + 1 WHERE id = ?",
+                (now_str, rule_id)
+            )
+            conn.commit()
+            log.info("[Correlation] %s", summary)
+
+    conn.close()
+
+
+def _correlation_loop():
+    """Background thread that runs correlation checks every 30 seconds."""
+    while not _stop_event.is_set():
+        try:
+            _run_correlation_check()
+        except Exception as exc:
+            log.error("[Correlation] Error: %s", exc)
+        _stop_event.wait(30)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Compliance Report Generator
+# ---------------------------------------------------------------------------
+COMPLIANCE_TEMPLATES = {
+    "pci_dss": {
+        "name": "PCI-DSS Log Review",
+        "description": "Payment Card Industry Data Security Standard - "
+                       "daily log review covering access, auth failures, "
+                       "privilege escalation, and system changes.",
+        "sections": [
+            "executive_summary", "log_volume", "auth_failures",
+            "privilege_events", "critical_alerts", "source_summary",
+            "security_connectors", "recommendations"
+        ],
+    },
+    "hipaa": {
+        "name": "HIPAA Security Audit",
+        "description": "Health Insurance Portability and Accountability Act - "
+                       "access monitoring, audit trail integrity, "
+                       "and incident response review.",
+        "sections": [
+            "executive_summary", "log_volume", "access_events",
+            "auth_failures", "critical_alerts", "source_summary",
+            "data_integrity", "recommendations"
+        ],
+    },
+    "soc2": {
+        "name": "SOC 2 Type II Evidence",
+        "description": "Service Organization Control 2 - "
+                       "security monitoring, availability, "
+                       "and incident response evidence.",
+        "sections": [
+            "executive_summary", "log_volume", "security_events",
+            "availability_metrics", "incident_response",
+            "source_summary", "recommendations"
+        ],
+    },
+    "nist_csf": {
+        "name": "NIST Cybersecurity Framework",
+        "description": "National Institute of Standards and Technology CSF - "
+                       "identify, protect, detect, respond, recover assessment.",
+        "sections": [
+            "executive_summary", "log_volume", "identify_assets",
+            "protect_access", "detect_anomalies", "respond_alerts",
+            "recover_summary", "recommendations"
+        ],
+    },
+    "cis_controls": {
+        "name": "CIS Controls Audit",
+        "description": "Center for Internet Security Controls - "
+                       "log management and monitoring compliance check.",
+        "sections": [
+            "executive_summary", "log_volume", "asset_inventory",
+            "audit_logging", "continuous_monitoring",
+            "incident_response", "recommendations"
+        ],
+    },
+    "custom": {
+        "name": "Custom Report",
+        "description": "Generate a custom compliance report with "
+                       "selected sections.",
+        "sections": [
+            "executive_summary", "log_volume", "auth_failures",
+            "critical_alerts", "source_summary", "recommendations"
+        ],
+    },
+}
+
+
+def _generate_compliance_report(report_id, template, date_from, date_to,
+                                parameters):
+    """Generate a compliance report (runs in background thread)."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE compliance_reports SET status = 'generating' WHERE id = ?",
+        (report_id,))
+    conn.commit()
+
+    try:
+        tpl = COMPLIANCE_TEMPLATES.get(template, COMPLIANCE_TEMPLATES["custom"])
+        params = json_mod.loads(parameters) if parameters else {}
+        title = params.get("title", tpl["name"])
+
+        # ---- Gather data ----
+        total_logs = conn.execute(
+            "SELECT COUNT(*) FROM logs WHERE timestamp >= ? AND timestamp <= ?",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        sev_dist = conn.execute(
+            "SELECT severity, COUNT(*) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "GROUP BY severity ORDER BY COUNT(*) DESC",
+            (date_from, date_to)
+        ).fetchall()
+
+        top_sources = conn.execute(
+            "SELECT source_ip, source_name, COUNT(*) as cnt FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "GROUP BY source_ip ORDER BY cnt DESC LIMIT 20",
+            (date_from, date_to)
+        ).fetchall()
+
+        alerts_total = conn.execute(
+            "SELECT COUNT(*) FROM alerts "
+            "WHERE timestamp >= ? AND timestamp <= ?",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        alerts_by_sev = conn.execute(
+            "SELECT severity, COUNT(*) FROM alerts "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "GROUP BY severity ORDER BY COUNT(*) DESC",
+            (date_from, date_to)
+        ).fetchall()
+
+        auth_fail_count = conn.execute(
+            "SELECT COUNT(*) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "AND (LOWER(message) LIKE '%failed%auth%' "
+            "  OR LOWER(message) LIKE '%authentication fail%' "
+            "  OR LOWER(message) LIKE '%login fail%' "
+            "  OR LOWER(message) LIKE '%invalid password%' "
+            "  OR LOWER(message) LIKE '%access denied%')",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        priv_events = conn.execute(
+            "SELECT COUNT(*) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "AND (LOWER(message) LIKE '%privilege%' "
+            "  OR LOWER(message) LIKE '%sudo%' "
+            "  OR LOWER(message) LIKE '%root%' "
+            "  OR LOWER(message) LIKE '%admin%' "
+            "  OR LOWER(message) LIKE '%escalat%')",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        critical_count = conn.execute(
+            "SELECT COUNT(*) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "AND severity_code <= 2",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        corr_incidents = conn.execute(
+            "SELECT COUNT(*) FROM correlation_incidents "
+            "WHERE created_at >= ? AND created_at <= ?",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        source_count = conn.execute(
+            "SELECT COUNT(DISTINCT source_ip) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ?",
+            (date_from, date_to)
+        ).fetchone()[0]
+
+        connector_count = conn.execute(
+            "SELECT COUNT(*) FROM security_connectors WHERE enabled = 1"
+        ).fetchone()[0]
+
+        daily_counts = conn.execute(
+            "SELECT DATE(timestamp) as d, COUNT(*) FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "GROUP BY d ORDER BY d",
+            (date_from, date_to)
+        ).fetchall()
+
+        # ---- Build HTML report ----
+        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        html = []
+        html.append("<!DOCTYPE html>")
+        html.append("<html><head>")
+        html.append("<meta charset='utf-8'>")
+        html.append("<title>%s - SentryLog Compliance Report</title>" %
+                    _html_esc(title))
+        html.append("<style>")
+        html.append("body{font-family:Arial,Helvetica,sans-serif;margin:40px;"
+                     "color:#1a1a2e;background:#fff;line-height:1.6}")
+        html.append("h1{color:#0f3460;border-bottom:3px solid #0f3460;"
+                     "padding-bottom:8px}")
+        html.append("h2{color:#16213e;margin-top:32px;border-bottom:1px solid #ddd;"
+                     "padding-bottom:6px}")
+        html.append("h3{color:#1a1a2e;margin-top:20px}")
+        html.append("table{border-collapse:collapse;width:100%;margin:12px 0}")
+        html.append("th,td{border:1px solid #ddd;padding:8px 12px;text-align:left}")
+        html.append("th{background:#0f3460;color:#fff;font-weight:600}")
+        html.append("tr:nth-child(even){background:#f8f9fa}")
+        html.append(".stat-grid{display:flex;flex-wrap:wrap;gap:16px;margin:16px 0}")
+        html.append(".stat-card{background:#f0f4ff;border:1px solid #d0d8f0;"
+                     "border-radius:8px;padding:16px 24px;min-width:160px}")
+        html.append(".stat-num{font-size:28px;font-weight:700;color:#0f3460}")
+        html.append(".stat-label{font-size:13px;color:#666;margin-top:4px}")
+        html.append(".finding{background:#fff3cd;border-left:4px solid #ffc107;"
+                     "padding:12px 16px;margin:8px 0;border-radius:0 4px 4px 0}")
+        html.append(".finding-critical{background:#f8d7da;border-left-color:#dc3545}")
+        html.append(".footer{margin-top:40px;padding-top:16px;"
+                     "border-top:2px solid #0f3460;font-size:12px;color:#888}")
+        html.append("@media print{body{margin:20px}}")
+        html.append("</style></head><body>")
+
+        # Header
+        html.append("<h1>%s</h1>" % _html_esc(title))
+        html.append("<p><strong>Report Period:</strong> %s to %s</p>" % (
+            _html_esc(date_from[:10]), _html_esc(date_to[:10])))
+        html.append("<p><strong>Generated:</strong> %s UTC by "
+                     "MyClover.Tech.SentryLog v%s</p>" % (now_str, VERSION))
+        html.append("<p><strong>Template:</strong> %s</p>" %
+                    _html_esc(tpl["name"]))
+
+        # Executive Summary
+        html.append("<h2>1. Executive Summary</h2>")
+        html.append("<div class='stat-grid'>")
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Total Log Events</div></div>" %
+                    _fmt_num(total_logs))
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Unique Sources</div></div>" %
+                    _fmt_num(source_count))
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Alerts Triggered</div></div>" %
+                    _fmt_num(alerts_total))
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Critical Events</div></div>" %
+                    _fmt_num(critical_count))
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Auth Failures</div></div>" %
+                    _fmt_num(auth_fail_count))
+        html.append("<div class='stat-card'><div class='stat-num'>%s</div>"
+                     "<div class='stat-label'>Correlation Incidents</div></div>" %
+                    _fmt_num(corr_incidents))
+        html.append("</div>")
+
+        if critical_count > 0:
+            html.append("<div class='finding finding-critical'>"
+                         "<strong>Critical Finding:</strong> %d critical/emergency "
+                         "events detected during the reporting period. "
+                         "Immediate review recommended.</div>" % critical_count)
+        if auth_fail_count > 50:
+            html.append("<div class='finding'>"
+                         "<strong>Warning:</strong> %d authentication failures "
+                         "detected. Possible brute-force activity.</div>" %
+                        auth_fail_count)
+
+        # Log Volume
+        html.append("<h2>2. Log Volume Analysis</h2>")
+        html.append("<h3>Daily Log Volume</h3>")
+        html.append("<table><tr><th>Date</th><th>Events</th></tr>")
+        for row in daily_counts:
+            html.append("<tr><td>%s</td><td>%s</td></tr>" % (
+                _html_esc(str(row[0])), _fmt_num(row[1])))
+        if not daily_counts:
+            html.append("<tr><td colspan='2'>No logs in this period</td></tr>")
+        html.append("</table>")
+
+        html.append("<h3>Severity Distribution</h3>")
+        html.append("<table><tr><th>Severity</th><th>Count</th>"
+                     "<th>Percentage</th></tr>")
+        for row in sev_dist:
+            pct = (row[1] / total_logs * 100) if total_logs > 0 else 0
+            html.append("<tr><td>%s</td><td>%s</td><td>%.1f%%</td></tr>" % (
+                _html_esc(str(row[0])), _fmt_num(row[1]), pct))
+        html.append("</table>")
+
+        # Authentication Failures
+        html.append("<h2>3. Authentication & Access Events</h2>")
+        html.append("<p>Authentication failures detected: "
+                     "<strong>%s</strong></p>" % _fmt_num(auth_fail_count))
+        html.append("<p>Privilege escalation events: "
+                     "<strong>%s</strong></p>" % _fmt_num(priv_events))
+
+        top_auth_sources = conn.execute(
+            "SELECT source_ip, COUNT(*) as cnt FROM logs "
+            "WHERE timestamp >= ? AND timestamp <= ? "
+            "AND (LOWER(message) LIKE '%failed%auth%' "
+            "  OR LOWER(message) LIKE '%authentication fail%' "
+            "  OR LOWER(message) LIKE '%login fail%') "
+            "GROUP BY source_ip ORDER BY cnt DESC LIMIT 10",
+            (date_from, date_to)
+        ).fetchall()
+
+        if top_auth_sources:
+            html.append("<h3>Top Sources of Auth Failures</h3>")
+            html.append("<table><tr><th>Source IP</th>"
+                         "<th>Failures</th></tr>")
+            for row in top_auth_sources:
+                html.append("<tr><td>%s</td><td>%s</td></tr>" % (
+                    _html_esc(str(row[0])), _fmt_num(row[1])))
+            html.append("</table>")
+
+        # Alerts & Incidents
+        html.append("<h2>4. Alerts & Correlation Incidents</h2>")
+        html.append("<p>Total alerts: <strong>%s</strong></p>" %
+                    _fmt_num(alerts_total))
+        if alerts_by_sev:
+            html.append("<table><tr><th>Severity</th><th>Count</th></tr>")
+            for row in alerts_by_sev:
+                html.append("<tr><td>%s</td><td>%s</td></tr>" % (
+                    _html_esc(str(row[0])), _fmt_num(row[1])))
+            html.append("</table>")
+        html.append("<p>Correlation incidents: "
+                     "<strong>%s</strong></p>" % _fmt_num(corr_incidents))
+
+        # Source Summary
+        html.append("<h2>5. Source Inventory</h2>")
+        html.append("<p>Active sources: <strong>%d</strong> | "
+                     "Security connectors: <strong>%d</strong></p>" % (
+                         source_count, connector_count))
+        html.append("<table><tr><th>Source IP</th><th>Name</th>"
+                     "<th>Events</th></tr>")
+        for row in top_sources:
+            html.append("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                _html_esc(str(row[0])),
+                _html_esc(str(row[1]) if row[1] else ""),
+                _fmt_num(row[2])))
+        html.append("</table>")
+
+        # Recommendations
+        html.append("<h2>6. Recommendations</h2>")
+        html.append("<ol>")
+        if critical_count > 0:
+            html.append("<li>Review and remediate %d critical events "
+                         "immediately.</li>" % critical_count)
+        if auth_fail_count > 20:
+            html.append("<li>Investigate %d authentication failures for "
+                         "potential brute-force or credential stuffing.</li>" %
+                        auth_fail_count)
+        if source_count < 5:
+            html.append("<li>Consider adding more log sources to improve "
+                         "visibility (currently %d sources).</li>" %
+                        source_count)
+        if connector_count == 0:
+            html.append("<li>Enable security API connectors (CrowdStrike, "
+                         "Defender, etc.) for deeper threat visibility.</li>")
+        if corr_incidents == 0 and total_logs > 100:
+            html.append("<li>Set up correlation rules to detect multi-source "
+                         "attack patterns.</li>")
+        html.append("<li>Ensure log retention meets compliance requirements "
+                     "for your framework.</li>")
+        html.append("<li>Schedule automated compliance reports for "
+                     "continuous monitoring.</li>")
+        html.append("</ol>")
+
+        # Footer
+        html.append("<div class='footer'>")
+        html.append("<p>Generated by MyClover.Tech.SentryLog v%s | "
+                     "Template: %s | Period: %s to %s</p>" % (
+                         VERSION, _html_esc(tpl["name"]),
+                         _html_esc(date_from[:10]),
+                         _html_esc(date_to[:10])))
+        html.append("<p>This report is auto-generated. Verify findings "
+                     "before taking action.</p>")
+        html.append("</div></body></html>")
+
+        full_html = "\n".join(html)
+        summary = ("Analyzed %s events from %d sources. "
+                   "%d alerts, %d critical events, %d auth failures, "
+                   "%d correlation incidents." % (
+                       _fmt_num(total_logs), source_count,
+                       alerts_total, critical_count,
+                       auth_fail_count, corr_incidents))
+
+        conn.execute(
+            "UPDATE compliance_reports SET status = 'completed', "
+            "html_content = ?, summary = ?, generated_at = ? WHERE id = ?",
+            (full_html, summary, now_str, report_id)
+        )
+        conn.commit()
+        log.info("[Compliance] Report %d generated: %s", report_id, summary)
+
+    except Exception as exc:
+        log.error("[Compliance] Report %d failed: %s", report_id, exc)
+        conn.execute(
+            "UPDATE compliance_reports SET status = 'failed', "
+            "summary = ? WHERE id = ?",
+            ("Error: %s" % str(exc)[:500], report_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _html_esc(text):
+    """Escape HTML special characters."""
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _fmt_num(n):
+    """Format a number with commas."""
+    try:
+        return "{:,}".format(int(n))
+    except (ValueError, TypeError):
+        return str(n)
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 def get_stats(hours=24):
@@ -3345,6 +3984,318 @@ if HAS_FLASK:
         conn.close()
         return jsonify({"status": "deleted"})
 
+    # ---- Phase 4: Correlation endpoints ----
+
+    @app.route("/api/correlation/rules")
+    @require_tier(TIER_PRO)
+    def api_corr_rules():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, name, description, conditions, time_window_seconds, "
+            "min_matches, severity, enabled, cooldown_minutes, last_fired, "
+            "fire_count, created_at, updated_at "
+            "FROM correlation_rules ORDER BY id"
+        ).fetchall()
+        conn.close()
+        rules = []
+        for r in rows:
+            rules.append({
+                "id": r[0], "name": r[1], "description": r[2],
+                "conditions": r[3], "time_window_seconds": r[4],
+                "min_matches": r[5], "severity": r[6],
+                "enabled": bool(r[7]), "cooldown_minutes": r[8],
+                "last_fired": r[9], "fire_count": r[10],
+                "created_at": r[11], "updated_at": r[12],
+            })
+        return jsonify({"rules": rules})
+
+    @app.route("/api/correlation/rules", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_create_corr_rule():
+        data = request.get_json(force=True)
+        name = data.get("name", "").strip()
+        if not name:
+            return jsonify({"error": True,
+                            "message": "Name is required."}), 400
+
+        conditions = data.get("conditions", "[]")
+        if isinstance(conditions, list):
+            conditions = json_mod.dumps(conditions)
+
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        c = conn.execute(
+            "INSERT INTO correlation_rules "
+            "(name, description, conditions, time_window_seconds, min_matches, "
+            " severity, enabled, cooldown_minutes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name,
+             data.get("description", ""),
+             conditions,
+             int(data.get("time_window_seconds", 300)),
+             int(data.get("min_matches", 2)),
+             data.get("severity", "critical"),
+             1 if data.get("enabled", True) else 0,
+             int(data.get("cooldown_minutes", 30)),
+             now, now)
+        )
+        new_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"id": new_id, "status": "created"})
+
+    @app.route("/api/correlation/rules/<int:rid>", methods=["PUT"])
+    @require_tier(TIER_PRO)
+    def api_update_corr_rule(rid):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_db()
+        fields = []
+        vals = []
+        for key in ("name", "description", "time_window_seconds",
+                     "min_matches", "severity", "cooldown_minutes"):
+            if key in data:
+                fields.append("%s = ?" % key)
+                vals.append(data[key])
+        if "conditions" in data:
+            cond = data["conditions"]
+            if isinstance(cond, list):
+                cond = json_mod.dumps(cond)
+            fields.append("conditions = ?")
+            vals.append(cond)
+        if "enabled" in data:
+            fields.append("enabled = ?")
+            vals.append(1 if data["enabled"] else 0)
+        fields.append("updated_at = ?")
+        vals.append(now)
+        vals.append(rid)
+
+        if fields:
+            conn.execute(
+                "UPDATE correlation_rules SET %s WHERE id = ?" %
+                ", ".join(fields), vals)
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/correlation/rules/<int:rid>", methods=["DELETE"])
+    @require_tier(TIER_PRO)
+    def api_delete_corr_rule(rid):
+        conn = get_db()
+        conn.execute("DELETE FROM correlation_rules WHERE id = ?", (rid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
+    @app.route("/api/correlation/incidents")
+    @require_tier(TIER_PRO)
+    def api_corr_incidents():
+        limit = int(request.args.get("limit", 100))
+        status_filter = request.args.get("status", "")
+
+        conn = get_db()
+        sql = ("SELECT id, rule_id, rule_name, severity, matched_events, "
+               "matched_count, summary, status, acknowledged, ack_by, "
+               "ack_at, created_at FROM correlation_incidents")
+        params = []
+        if status_filter:
+            sql += " WHERE status = ?"
+            params.append(status_filter)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+
+        incidents = []
+        for r in rows:
+            incidents.append({
+                "id": r[0], "rule_id": r[1], "rule_name": r[2],
+                "severity": r[3], "matched_events": r[4],
+                "matched_count": r[5], "summary": r[6],
+                "status": r[7], "acknowledged": bool(r[8]),
+                "ack_by": r[9], "ack_at": r[10],
+                "created_at": r[11],
+            })
+        return jsonify({"incidents": incidents})
+
+    @app.route("/api/correlation/incidents/<int:iid>/acknowledge",
+               methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_ack_corr_incident(iid):
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        conn.execute(
+            "UPDATE correlation_incidents SET acknowledged = 1, "
+            "status = 'acknowledged', ack_at = ? WHERE id = ?",
+            (now, iid))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "acknowledged"})
+
+    @app.route("/api/correlation/incidents/<int:iid>/close",
+               methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_close_corr_incident(iid):
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        conn.execute(
+            "UPDATE correlation_incidents SET status = 'closed', "
+            "ack_at = ? WHERE id = ?",
+            (now, iid))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "closed"})
+
+    @app.route("/api/correlation/status")
+    @require_tier(TIER_PRO)
+    def api_corr_status():
+        conn = get_db()
+        total_rules = conn.execute(
+            "SELECT COUNT(*) FROM correlation_rules"
+        ).fetchone()[0]
+        enabled_rules = conn.execute(
+            "SELECT COUNT(*) FROM correlation_rules WHERE enabled = 1"
+        ).fetchone()[0]
+        open_incidents = conn.execute(
+            "SELECT COUNT(*) FROM correlation_incidents WHERE status = 'open'"
+        ).fetchone()[0]
+        total_incidents = conn.execute(
+            "SELECT COUNT(*) FROM correlation_incidents"
+        ).fetchone()[0]
+        conn.close()
+
+        return jsonify({
+            "total_rules": total_rules,
+            "enabled_rules": enabled_rules,
+            "open_incidents": open_incidents,
+            "total_incidents": total_incidents,
+            "buffer_size": len(_correlation_buffer),
+        })
+
+    # ---- Phase 4: Compliance Report endpoints (Enterprise) ----
+
+    @app.route("/api/compliance/templates")
+    @require_tier(TIER_ENT)
+    def api_compliance_templates():
+        templates = {}
+        for key, tpl in COMPLIANCE_TEMPLATES.items():
+            templates[key] = {
+                "name": tpl["name"],
+                "description": tpl["description"],
+                "sections": tpl["sections"],
+            }
+        return jsonify({"templates": templates})
+
+    @app.route("/api/compliance/reports/generate", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_generate_compliance_report():
+        data = request.get_json(force=True)
+        template = data.get("template", "custom")
+        if template not in COMPLIANCE_TEMPLATES:
+            return jsonify({"error": True,
+                            "message": "Invalid template."}), 400
+
+        date_from = data.get("date_from", "")
+        date_to = data.get("date_to", "")
+        if not date_from or not date_to:
+            return jsonify({"error": True,
+                            "message": "date_from and date_to required."}), 400
+
+        params = data.get("parameters", "{}")
+        if isinstance(params, dict):
+            params = json_mod.dumps(params)
+
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        c = conn.execute(
+            "INSERT INTO compliance_reports "
+            "(template, title, date_from, date_to, parameters, "
+            " status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (template,
+             data.get("title", COMPLIANCE_TEMPLATES[template]["name"]),
+             date_from, date_to, params, now)
+        )
+        report_id = c.lastrowid
+        conn.commit()
+        conn.close()
+
+        # Generate in background thread
+        t = threading.Thread(
+            target=_generate_compliance_report,
+            args=(report_id, template, date_from, date_to, params),
+            daemon=True
+        )
+        t.start()
+
+        return jsonify({"id": report_id, "status": "generating"})
+
+    @app.route("/api/compliance/reports")
+    @require_tier(TIER_ENT)
+    def api_list_compliance_reports():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, template, title, date_from, date_to, status, "
+            "summary, generated_at, created_at "
+            "FROM compliance_reports ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        reports = []
+        for r in rows:
+            reports.append({
+                "id": r[0], "template": r[1], "title": r[2],
+                "date_from": r[3], "date_to": r[4],
+                "status": r[5], "summary": r[6],
+                "generated_at": r[7], "created_at": r[8],
+            })
+        return jsonify({"reports": reports})
+
+    @app.route("/api/compliance/reports/<int:rid>")
+    @require_tier(TIER_ENT)
+    def api_get_compliance_report(rid):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id, template, title, date_from, date_to, status, "
+            "html_content, summary, generated_at, created_at "
+            "FROM compliance_reports WHERE id = ?", (rid,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": True, "message": "Not found."}), 404
+
+        return jsonify({
+            "id": row[0], "template": row[1], "title": row[2],
+            "date_from": row[3], "date_to": row[4],
+            "status": row[5], "html_content": row[6],
+            "summary": row[7], "generated_at": row[8],
+            "created_at": row[9],
+        })
+
+    @app.route("/api/compliance/reports/<int:rid>/html")
+    @require_tier(TIER_ENT)
+    def api_compliance_report_html(rid):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT html_content, status FROM compliance_reports WHERE id = ?",
+            (rid,)
+        ).fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return "<html><body><h1>Report not found or not generated yet."  \
+                   "</h1></body></html>", 404
+        from flask import Response
+        return Response(row[0], mimetype="text/html")
+
+    @app.route("/api/compliance/reports/<int:rid>", methods=["DELETE"])
+    @require_tier(TIER_ENT)
+    def api_delete_compliance_report(rid):
+        conn = get_db()
+        conn.execute("DELETE FROM compliance_reports WHERE id = ?", (rid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
     # ---- Test / Utility ----
     @app.route("/api/test-log", methods=["POST"])
     def api_test_log():
@@ -3460,6 +4411,11 @@ def main():
 
     # Start Security API connectors (Phase 3)
     _start_all_security_connectors()
+
+    # Start Correlation Engine (Phase 4)
+    corr_thread = threading.Thread(target=_correlation_loop, daemon=True)
+    corr_thread.start()
+    log.info("Correlation engine started (30s check interval)")
 
     # Start dashboard
     if HAS_FLASK:
