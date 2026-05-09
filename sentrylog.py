@@ -1,43 +1,24 @@
 #!/usr/bin/env python3
 """
-MyClover.Tech.SentryLog v3.0 - Log Aggregation & Security Alert Platform
+MyClover.Tech.SentryLog v6.0 - Log Aggregation & Security Alert Platform
 
 A standalone log aggregation and SIEM-lite product from the MyClover.Tech suite.
-Collects syslog from any device, reads Windows Event Logs locally or remotely,
-parses and stores logs, fires alerts on pattern matches, and provides a
-searchable dashboard.
+Collects syslog from any device, reads Windows/Linux/Mac log files locally or
+remotely, parses and stores logs, fires alerts on pattern matches, and provides
+a searchable dashboard with compliance reporting.
 
 Can run standalone or as an add-on to MyClover.Tech.netmon.
 
 Features:
-  Phase 1:
-  - Syslog receiver (UDP + TCP, RFC 3164 / RFC 5424)
-  - Auto-discovery of log sources
-  - SQLite storage with configurable retention
-  - Pattern-based alert rules with severity filtering
-  - Real-time log viewer with search/filter
-  - Source management dashboard
-  - REST API for all operations
-  - Dark-themed web dashboard
-  - Netmon add-on integration
-
-  Phase 2:
-  - Windows Event Log collector (local via pywin32)
-  - Windows Event Log collector (remote via WinRM / pywinrm)
-  - Collects from Security, System, Application, and custom channels
-  - Event severity mapping (Windows EventType -> syslog severity)
-  - Bookmark tracking to avoid duplicate collection
-  - Configurable poll intervals per target
-  - Enterprise tier feature
-
-  Phase 3 (NEW):
-  - Security product API connectors (CrowdStrike, SentinelOne,
-    Microsoft Defender, Sophos Central, Palo Alto Cortex XDR)
-  - Generic inbound webhook receiver for any security tool
-  - Connector management dashboard tab
-  - Per-connector API key storage and test-connectivity
-  - Automatic event normalization into the SentryLog pipeline
-  - Enterprise tier feature
+  Phase 1: Core syslog receiver, SQLite storage, alert rules, dashboard, API
+  Phase 2: Windows Event Log (local pywin32 + remote WinRM)
+  Phase 3: Security vendor connectors (CrowdStrike, SentinelOne, Defender,
+           Sophos, Cortex XDR, generic REST)
+  Phase 4: Cross-source correlation engine, compliance report generator
+  Phase 5: Email/webhook notifications, scheduled reports, log search &
+           export (CSV/JSON), dashboard chart enhancements
+  Phase 6: Linux/Mac log file tailing, log forwarding to external SIEM,
+           API key authentication, rate limiting
 """
 
 import os
@@ -55,6 +36,13 @@ import re
 import json as json_mod
 import select
 import traceback
+import csv
+import io
+import smtplib
+import secrets
+import functools
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from collections import defaultdict
 
@@ -106,7 +94,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION = "4.0.0"
+VERSION = "6.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "sentrylog.db"
 DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
@@ -114,6 +102,7 @@ DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
 _config = {}
 _config_lock = threading.Lock()
 _running = True
+_stop_event = threading.Event()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,6 +130,14 @@ TIER_FEATURES = {
         "windows_eventlog": False,
         "api_connectors": False,
         "correlation": False,
+        "email_notifications": False,
+        "scheduled_reports": False,
+        "log_export": False,
+        "file_tailing": False,
+        "log_forwarding": False,
+        "api_keys": False,
+        "max_file_targets": 0,
+        "max_forwarding_targets": 0,
     },
     TIER_PRO: {
         "max_sources": 50,
@@ -150,7 +147,15 @@ TIER_FEATURES = {
         "syslog": True,
         "windows_eventlog": False,
         "api_connectors": False,
-        "correlation": False,
+        "correlation": True,
+        "email_notifications": True,
+        "scheduled_reports": False,
+        "log_export": True,
+        "file_tailing": True,
+        "log_forwarding": True,
+        "api_keys": True,
+        "max_file_targets": 10,
+        "max_forwarding_targets": 3,
     },
     TIER_ENT: {
         "max_sources": 9999,
@@ -161,6 +166,14 @@ TIER_FEATURES = {
         "windows_eventlog": True,
         "api_connectors": True,
         "correlation": True,
+        "email_notifications": True,
+        "scheduled_reports": True,
+        "log_export": True,
+        "file_tailing": True,
+        "log_forwarding": True,
+        "api_keys": True,
+        "max_file_targets": 9999,
+        "max_forwarding_targets": 9999,
     },
 }
 
@@ -325,6 +338,20 @@ def _default_config():
         "netmon_integration": {
             "enabled": False,
             "netmon_url": "http://localhost:8080",
+        },
+        "notifications": {
+            "email_enabled": False,
+            "webhook_enabled": False,
+            "webhook_url": "",
+            "cooldown_minutes": 5,
+        },
+        "file_targets": [],
+        "forwarding": {
+            "targets": [],
+        },
+        "api_auth": {
+            "enabled": False,
+            "rate_limit_per_minute": 120,
         },
     }
 
@@ -562,6 +589,119 @@ def init_db():
         )
     """)
 
+    # Phase 5: Notification channels
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            channel_type TEXT NOT NULL DEFAULT 'email',
+            config TEXT DEFAULT '{}',
+            enabled INTEGER DEFAULT 1,
+            last_sent TEXT DEFAULT '',
+            send_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 5: Notification log
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER,
+            channel_name TEXT DEFAULT '',
+            alert_id INTEGER,
+            subject TEXT DEFAULT '',
+            status TEXT DEFAULT 'sent',
+            error_message TEXT DEFAULT '',
+            sent_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 5: Scheduled reports
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            template TEXT NOT NULL DEFAULT 'custom',
+            schedule TEXT NOT NULL DEFAULT 'weekly',
+            recipients TEXT DEFAULT '[]',
+            parameters TEXT DEFAULT '{}',
+            enabled INTEGER DEFAULT 1,
+            last_run TEXT DEFAULT '',
+            next_run TEXT DEFAULT '',
+            run_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 6: Log file targets (Linux/Mac file tailing)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS file_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            parse_format TEXT DEFAULT 'auto',
+            source_name TEXT DEFAULT '',
+            default_facility TEXT DEFAULT 'local0',
+            default_severity TEXT DEFAULT 'info',
+            enabled INTEGER DEFAULT 1,
+            last_position INTEGER DEFAULT 0,
+            last_inode INTEGER DEFAULT 0,
+            last_read TEXT DEFAULT '',
+            log_count INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 6: Log forwarding targets
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS forwarding_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT 'syslog',
+            host TEXT DEFAULT '',
+            port INTEGER DEFAULT 514,
+            protocol TEXT DEFAULT 'udp',
+            webhook_url TEXT DEFAULT '',
+            filter_severity TEXT DEFAULT '',
+            filter_source TEXT DEFAULT '',
+            filter_facility TEXT DEFAULT '',
+            format TEXT DEFAULT 'rfc3164',
+            enabled INTEGER DEFAULT 1,
+            last_forwarded TEXT DEFAULT '',
+            forward_count INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Phase 6: API keys
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_hash TEXT NOT NULL UNIQUE,
+            key_prefix TEXT NOT NULL,
+            label TEXT NOT NULL,
+            permissions TEXT DEFAULT 'read',
+            enabled INTEGER DEFAULT 1,
+            last_used TEXT DEFAULT '',
+            use_count INTEGER DEFAULT 0,
+            rate_limit INTEGER DEFAULT 120,
+            created_at TEXT NOT NULL,
+            expires_at TEXT DEFAULT ''
+        )
+    """)
+
+    # Phase 6: Rate limiting tracker (in-memory, but log to DB for audit)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_api_keys_hash
+        ON api_keys(key_hash)
+    """)
+
     conn.commit()
     conn.close()
     log.info("Database initialized at %s", DB_PATH)
@@ -717,6 +857,12 @@ def ingest_log(parsed):
     # Phase 4: Feed correlation engine
     _corr_add_event(parsed)
 
+    # Phase 6: Forward log to external targets
+    try:
+        forward_log(parsed)
+    except Exception:
+        pass
+
     with _log_buffer_lock:
         _log_buffer.append(parsed)
         if len(_log_buffer) >= _BUFFER_FLUSH_SIZE:
@@ -853,6 +999,760 @@ def _check_alert_rules(cursor, entry, log_id):
 
             log.info("[ALERT] Rule '%s' fired on log from %s: %s",
                      rule["name"], entry["source_ip"], entry["message"][:100])
+
+            # Phase 5: Send notifications for this alert
+            _send_alert_notifications(
+                cursor, rule["name"], entry["severity"],
+                entry["source_ip"], entry["message"][:500]
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Email & Webhook Notification Engine
+# ---------------------------------------------------------------------------
+_notification_cooldown = {}  # channel_id -> last_sent_timestamp
+_notification_lock = threading.Lock()
+
+
+def _send_email(smtp_host, smtp_port, use_tls, username, password,
+                from_addr, to_addrs, subject, body_html):
+    """Send an email via SMTP. Returns (success, error_msg)."""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = from_addr
+        msg["To"] = ", ".join(to_addrs) if isinstance(to_addrs, list) else to_addrs
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+        if use_tls:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+            server.starttls()
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+        if username and password:
+            server.login(username, password)
+        recipients = to_addrs if isinstance(to_addrs, list) else [to_addrs]
+        server.sendmail(from_addr, recipients, msg.as_string())
+        server.quit()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _send_webhook(url, payload):
+    """Send a JSON payload to a webhook URL. Returns (success, error_msg)."""
+    if not HAS_REQUESTS:
+        return False, "requests library not installed"
+    try:
+        resp = requests_lib.post(url, json=payload, timeout=10)
+        if resp.status_code < 300:
+            return True, ""
+        return False, "HTTP %d: %s" % (resp.status_code, resp.text[:200])
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _send_alert_notifications(cursor, rule_name, severity, source_ip, message):
+    """Send alert notifications to all enabled channels."""
+    features = get_tier_features()
+    if not features.get("email_notifications"):
+        return
+
+    now = datetime.datetime.utcnow()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Global notification cooldown
+    with _config_lock:
+        cooldown_min = _config.get("notifications", {}).get("cooldown_minutes", 5)
+
+    try:
+        channels = cursor.execute(
+            "SELECT * FROM notification_channels WHERE enabled = 1"
+        ).fetchall()
+    except Exception:
+        return
+
+    for ch in channels:
+        ch_id = ch["id"]
+        ch_type = ch["channel_type"]
+
+        # Per-channel cooldown
+        with _notification_lock:
+            last = _notification_cooldown.get(ch_id)
+            if last:
+                if (now - last).total_seconds() < cooldown_min * 60:
+                    continue
+            _notification_cooldown[ch_id] = now
+
+        try:
+            ch_config = json_mod.loads(ch["config"]) if ch["config"] else {}
+        except (json_mod.JSONDecodeError, TypeError):
+            ch_config = {}
+
+        success = False
+        error = ""
+
+        if ch_type == "email":
+            smtp_cfg = ch_config
+            subject = "[SentryLog Alert] %s - %s from %s" % (
+                severity.upper(), rule_name, source_ip)
+            body = (
+                "<html><body style='font-family:sans-serif;background:#1a1a2e;"
+                "color:#e0e0e0;padding:24px'>"
+                "<h2 style='color:#ef4444'>SentryLog Alert</h2>"
+                "<table style='border-collapse:collapse'>"
+                "<tr><td style='padding:6px 12px;color:#888'>Rule:</td>"
+                "<td style='padding:6px 12px;font-weight:bold'>%s</td></tr>"
+                "<tr><td style='padding:6px 12px;color:#888'>Severity:</td>"
+                "<td style='padding:6px 12px;color:#ef4444;font-weight:bold'>%s</td></tr>"
+                "<tr><td style='padding:6px 12px;color:#888'>Source:</td>"
+                "<td style='padding:6px 12px'>%s</td></tr>"
+                "<tr><td style='padding:6px 12px;color:#888'>Time:</td>"
+                "<td style='padding:6px 12px'>%s UTC</td></tr>"
+                "</table>"
+                "<pre style='background:#111;padding:16px;border-radius:8px;"
+                "margin-top:16px;white-space:pre-wrap'>%s</pre>"
+                "<hr style='border-color:#333;margin-top:24px'>"
+                "<p style='color:#666;font-size:12px'>MyClover.Tech.SentryLog v%s</p>"
+                "</body></html>"
+            ) % (_html_esc(rule_name), _html_esc(severity.upper()),
+                 _html_esc(source_ip), _html_esc(now_str),
+                 _html_esc(message), VERSION)
+            recipients = smtp_cfg.get("recipients", [])
+            if not recipients:
+                with _config_lock:
+                    recipients = _config.get("alerting", {}).get(
+                        "email", {}).get("recipients", [])
+            if recipients:
+                with _config_lock:
+                    ecfg = _config.get("alerting", {}).get("email", {})
+                success, error = _send_email(
+                    smtp_cfg.get("smtp_host", ecfg.get("smtp_host", "")),
+                    smtp_cfg.get("smtp_port", ecfg.get("smtp_port", 587)),
+                    smtp_cfg.get("use_tls", ecfg.get("use_tls", True)),
+                    smtp_cfg.get("username", ecfg.get("username", "")),
+                    smtp_cfg.get("password", ecfg.get("password", "")),
+                    smtp_cfg.get("from_addr", ecfg.get("from_addr", "")),
+                    recipients, subject, body,
+                )
+        elif ch_type == "webhook":
+            wh_url = ch_config.get("url", "")
+            if wh_url:
+                payload = {
+                    "product": "SentryLog",
+                    "version": VERSION,
+                    "event": "alert",
+                    "rule_name": rule_name,
+                    "severity": severity,
+                    "source_ip": source_ip,
+                    "message": message,
+                    "timestamp": now_str,
+                }
+                success, error = _send_webhook(wh_url, payload)
+
+        # Log the notification
+        status = "sent" if success else "failed"
+        try:
+            cursor.execute(
+                "INSERT INTO notification_log "
+                "(channel_id, channel_name, alert_id, subject, status, "
+                " error_message, sent_at) "
+                "VALUES (?, ?, 0, ?, ?, ?, ?)",
+                (ch_id, ch["name"], rule_name, status, error, now_str)
+            )
+            cursor.execute(
+                "UPDATE notification_channels SET last_sent = ?, "
+                "send_count = send_count + 1 WHERE id = ?",
+                (now_str, ch_id)
+            )
+        except Exception:
+            pass
+
+        if success:
+            log.info("[Notification] Sent to '%s' (%s)", ch["name"], ch_type)
+        elif error:
+            log.warning("[Notification] Failed '%s': %s", ch["name"], error)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Scheduled Report Engine
+# ---------------------------------------------------------------------------
+def _compute_next_run(schedule, last_run_str=""):
+    """Compute the next run time for a schedule (daily, weekly, monthly)."""
+    now = datetime.datetime.utcnow()
+    if schedule == "daily":
+        # Run at 06:00 UTC each day
+        nxt = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += datetime.timedelta(days=1)
+    elif schedule == "weekly":
+        # Run Monday at 06:00 UTC
+        nxt = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        days_ahead = 0 - nxt.weekday()  # Monday=0
+        if days_ahead <= 0:
+            days_ahead += 7
+        nxt += datetime.timedelta(days=days_ahead)
+    elif schedule == "monthly":
+        # Run 1st of month at 06:00 UTC
+        if now.day == 1 and now.hour < 6:
+            nxt = now.replace(day=1, hour=6, minute=0, second=0, microsecond=0)
+        else:
+            month = now.month + 1
+            year = now.year
+            if month > 12:
+                month = 1
+                year += 1
+            nxt = datetime.datetime(year, month, 1, 6, 0, 0)
+    else:
+        nxt = now + datetime.timedelta(hours=24)
+    return nxt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _scheduled_report_loop():
+    """Background thread that checks and generates scheduled reports."""
+    while not _stop_event.is_set():
+        try:
+            _check_scheduled_reports()
+        except Exception as exc:
+            log.error("[ScheduledReports] Error: %s", exc)
+        _stop_event.wait(60)  # check every minute
+
+
+def _check_scheduled_reports():
+    """Check if any scheduled reports need to run."""
+    features = get_tier_features()
+    if not features.get("scheduled_reports"):
+        return
+
+    now = datetime.datetime.utcnow()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_db()
+    reports = conn.execute(
+        "SELECT * FROM scheduled_reports WHERE enabled = 1"
+    ).fetchall()
+
+    for report in reports:
+        next_run = report["next_run"]
+        if not next_run or next_run <= now_str:
+            # Time to generate
+            template = report["template"]
+            schedule = report["schedule"]
+
+            # Compute date range based on schedule
+            if schedule == "daily":
+                date_from = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                date_to = now.strftime("%Y-%m-%d")
+            elif schedule == "weekly":
+                date_from = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                date_to = now.strftime("%Y-%m-%d")
+            else:  # monthly
+                date_from = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+                date_to = now.strftime("%Y-%m-%d")
+
+            try:
+                params = json_mod.loads(report["parameters"]) if report["parameters"] else {}
+            except (json_mod.JSONDecodeError, TypeError):
+                params = {}
+
+            # Create a compliance report entry
+            conn.execute(
+                "INSERT INTO compliance_reports "
+                "(template, title, date_from, date_to, parameters, "
+                " status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                (template,
+                 "Scheduled: %s (%s)" % (report["name"], schedule),
+                 date_from, date_to,
+                 json_mod.dumps(params), now_str)
+            )
+            report_id = conn.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
+
+            # Generate it
+            threading.Thread(
+                target=_generate_compliance_report,
+                args=(report_id, template, date_from, date_to, params),
+                daemon=True,
+            ).start()
+
+            # Update schedule
+            new_next = _compute_next_run(schedule)
+            conn.execute(
+                "UPDATE scheduled_reports SET last_run = ?, next_run = ?, "
+                "run_count = run_count + 1, updated_at = ? WHERE id = ?",
+                (now_str, new_next, now_str, report["id"])
+            )
+            conn.commit()
+            log.info("[ScheduledReport] Generated '%s' (%s), next: %s",
+                     report["name"], template, new_next)
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Log File Tailing (Linux/Mac)
+# ---------------------------------------------------------------------------
+_file_tail_threads = {}   # target_id -> threading.Thread
+_file_tail_stops = {}     # target_id -> threading.Event
+
+
+def _parse_syslog_file_line(line, source_name, default_facility, default_severity):
+    """Parse a line from a syslog-style log file."""
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    entry = {
+        "timestamp": now,
+        "received_at": now,
+        "source_ip": "127.0.0.1",
+        "source_name": source_name,
+        "facility": default_facility,
+        "facility_code": -3,  # -3 = file tailing marker
+        "severity": default_severity,
+        "severity_code": {"emergency":0,"alert":1,"critical":2,"error":3,
+                          "warning":4,"notice":5,"info":6,"debug":7}.get(
+                             default_severity, 6),
+        "app_name": "",
+        "process_id": "",
+        "message": line,
+        "raw": line,
+    }
+
+    # Try to detect severity from line content
+    lower = line.lower()
+    if any(w in lower for w in ["emerg", "panic"]):
+        entry["severity"] = "emergency"
+        entry["severity_code"] = 0
+    elif "alert" in lower and "alert:" in lower:
+        entry["severity"] = "alert"
+        entry["severity_code"] = 1
+    elif any(w in lower for w in ["crit", "critical"]):
+        entry["severity"] = "critical"
+        entry["severity_code"] = 2
+    elif any(w in lower for w in ["error", "err ", "failed"]):
+        entry["severity"] = "error"
+        entry["severity_code"] = 3
+    elif any(w in lower for w in ["warn", "warning"]):
+        entry["severity"] = "warning"
+        entry["severity_code"] = 4
+
+    # Try RFC 3164 timestamp: "Mon DD HH:MM:SS"
+    m = re.match(
+        r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*)",
+        line, re.DOTALL
+    )
+    if m:
+        ts_str = m.group(1)
+        entry["source_name"] = m.group(2) if not source_name else source_name
+        rest = m.group(3)
+        try:
+            year = datetime.datetime.utcnow().year
+            dt = datetime.datetime.strptime(
+                "%d %s" % (year, ts_str), "%Y %b %d %H:%M:%S"
+            )
+            entry["timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+        # Extract app[pid]:
+        am = re.match(r"^(\S+?)(?:\[(\d+)\])?:\s*(.*)", rest, re.DOTALL)
+        if am:
+            entry["app_name"] = am.group(1)
+            entry["process_id"] = am.group(2) or ""
+            entry["message"] = am.group(3).strip()
+        else:
+            entry["message"] = rest
+        return entry
+
+    # Try ISO timestamp: "2024-01-15 12:30:45"
+    m2 = re.match(r"^(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2})\s+(.*)", line, re.DOTALL)
+    if m2:
+        entry["timestamp"] = m2.group(1).replace("T", " ")[:19]
+        entry["message"] = m2.group(2).strip()
+        return entry
+
+    return entry
+
+
+def _tail_file(target_id, file_path, source_name, default_facility,
+               default_severity, stop_event):
+    """Tail a log file and ingest new lines."""
+    log.info("[FileTail] Starting tail on %s (target %d)", file_path, target_id)
+    position = 0
+    inode = 0
+
+    # Get last known position from DB
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT last_position, last_inode FROM file_targets WHERE id = ?",
+            (target_id,)
+        ).fetchone()
+        if row:
+            position = row["last_position"] or 0
+            inode = row["last_inode"] or 0
+        conn.close()
+    except Exception:
+        pass
+
+    while not stop_event.is_set():
+        try:
+            if not os.path.exists(file_path):
+                time.sleep(5)
+                continue
+
+            stat = os.stat(file_path)
+            current_inode = stat.st_ino if hasattr(stat, "st_ino") else 0
+            file_size = stat.st_size
+
+            # Detect log rotation (inode changed or file shrunk)
+            if current_inode != inode and inode != 0:
+                log.info("[FileTail] Rotation detected on %s, resetting", file_path)
+                position = 0
+                inode = current_inode
+            elif file_size < position:
+                log.info("[FileTail] File truncated %s, resetting", file_path)
+                position = 0
+
+            inode = current_inode
+
+            if file_size == position:
+                stop_event.wait(2)
+                continue
+
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(position)
+                lines_read = 0
+                for line in fh:
+                    line = line.rstrip("\n\r")
+                    if line:
+                        entry = _parse_syslog_file_line(
+                            line, source_name, default_facility, default_severity
+                        )
+                        ingest_log(entry)
+                        lines_read += 1
+                position = fh.tell()
+
+            # Update DB with new position
+            if lines_read > 0:
+                now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE file_targets SET last_position = ?, "
+                        "last_inode = ?, last_read = ?, "
+                        "log_count = log_count + ?, error_message = '' "
+                        "WHERE id = ?",
+                        (position, inode, now, lines_read, target_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+            stop_event.wait(2)
+
+        except Exception as exc:
+            log.error("[FileTail] Error tailing %s: %s", file_path, exc)
+            try:
+                conn = get_db()
+                conn.execute(
+                    "UPDATE file_targets SET error_message = ? WHERE id = ?",
+                    (str(exc)[:500], target_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            stop_event.wait(10)
+
+    log.info("[FileTail] Stopped tailing %s (target %d)", file_path, target_id)
+
+
+def start_file_tail(target):
+    """Start a file tailing thread for a target."""
+    target_id = target["id"] if isinstance(target, dict) else target[0]
+    fp = target["file_path"] if isinstance(target, dict) else target[2]
+    src = target.get("source_name", "") if isinstance(target, dict) else (target[4] or "")
+    fac = target.get("default_facility", "local0") if isinstance(target, dict) else "local0"
+    sev = target.get("default_severity", "info") if isinstance(target, dict) else "info"
+
+    if not src:
+        src = os.path.basename(fp)
+
+    stop_event = threading.Event()
+    _file_tail_stops[target_id] = stop_event
+
+    t = threading.Thread(
+        target=_tail_file,
+        args=(target_id, fp, src, fac, sev, stop_event),
+        daemon=True,
+    )
+    t.start()
+    _file_tail_threads[target_id] = t
+    log.info("[FileTail] Collector started for target %d: %s", target_id, fp)
+
+
+def stop_file_tail(target_id):
+    """Stop a file tailing thread."""
+    ev = _file_tail_stops.pop(target_id, None)
+    if ev:
+        ev.set()
+    _file_tail_threads.pop(target_id, None)
+
+
+def _start_all_file_tails():
+    """Start all enabled file targets from the database."""
+    features = get_tier_features()
+    if not features.get("file_tailing"):
+        return
+    try:
+        conn = get_db()
+        targets = conn.execute(
+            "SELECT * FROM file_targets WHERE enabled = 1"
+        ).fetchall()
+        conn.close()
+        for t in targets:
+            start_file_tail(dict(t))
+        if targets:
+            log.info("[FileTail] Started %d file target(s)", len(targets))
+    except Exception as exc:
+        log.error("[FileTail] Failed to start collectors: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Log Forwarding Engine
+# ---------------------------------------------------------------------------
+_forwarding_lock = threading.Lock()
+_forwarding_sockets = {}  # target_id -> socket
+
+
+def forward_log(entry):
+    """Forward a log entry to all enabled forwarding targets."""
+    features = get_tier_features()
+    if not features.get("log_forwarding"):
+        return
+
+    try:
+        conn = get_db()
+        targets = conn.execute(
+            "SELECT * FROM forwarding_targets WHERE enabled = 1"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return
+
+    for target in targets:
+        # Apply filters
+        if target["filter_severity"]:
+            allowed = [s.strip().lower() for s in target["filter_severity"].split(",")]
+            if entry.get("severity", "info").lower() not in allowed:
+                continue
+        if target["filter_source"]:
+            allowed = [s.strip() for s in target["filter_source"].split(",")]
+            if (entry.get("source_ip", "") not in allowed and
+                    entry.get("source_name", "") not in allowed):
+                continue
+        if target["filter_facility"]:
+            allowed = [s.strip().lower() for s in target["filter_facility"].split(",")]
+            if entry.get("facility", "").lower() not in allowed:
+                continue
+
+        try:
+            _forward_to_target(target, entry)
+        except Exception as exc:
+            log.debug("[Forwarding] Error forwarding to %s: %s",
+                      target["name"], exc)
+
+
+def _forward_to_target(target, entry):
+    """Forward a single log entry to a forwarding target."""
+    tid = target["id"]
+    ttype = target["target_type"]
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if ttype == "syslog":
+        # Build syslog message
+        sev_code = entry.get("severity_code", 6)
+        fac_code = entry.get("facility_code", 16)
+        if fac_code < 0:
+            fac_code = 16  # local0
+        pri = fac_code * 8 + sev_code
+        hostname = entry.get("source_name", entry.get("source_ip", "-"))
+        app = entry.get("app_name", "sentrylog")
+        msg = entry.get("message", "")
+
+        if target["format"] == "rfc5424":
+            ts = entry.get("timestamp", now).replace(" ", "T") + "Z"
+            pid = entry.get("process_id", "-") or "-"
+            syslog_msg = "<%d>1 %s %s %s %s - - %s" % (
+                pri, ts, hostname, app, pid, msg)
+        else:
+            ts = entry.get("timestamp", now)
+            syslog_msg = "<%d>%s %s %s: %s" % (pri, ts, hostname, app, msg)
+
+        data = syslog_msg.encode("utf-8", errors="replace")
+
+        if target["protocol"] == "tcp":
+            with _forwarding_lock:
+                sock = _forwarding_sockets.get(tid)
+                if not sock:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    sock.connect((target["host"], target["port"]))
+                    _forwarding_sockets[tid] = sock
+                try:
+                    sock.send(data + b"\n")
+                except Exception:
+                    # Reconnect on error
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    sock.connect((target["host"], target["port"]))
+                    sock.send(data + b"\n")
+                    _forwarding_sockets[tid] = sock
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(data, (target["host"], target["port"]))
+            sock.close()
+
+    elif ttype == "webhook":
+        if HAS_REQUESTS and target["webhook_url"]:
+            payload = {
+                "product": "SentryLog",
+                "event": "log_forward",
+                "timestamp": entry.get("timestamp", now),
+                "source_ip": entry.get("source_ip", ""),
+                "source_name": entry.get("source_name", ""),
+                "severity": entry.get("severity", "info"),
+                "facility": entry.get("facility", ""),
+                "app_name": entry.get("app_name", ""),
+                "message": entry.get("message", ""),
+            }
+            requests_lib.post(
+                target["webhook_url"], json=payload, timeout=5
+            )
+
+    # Update stats
+    try:
+        conn = get_db()
+        conn.execute(
+            "UPDATE forwarding_targets SET last_forwarded = ?, "
+            "forward_count = forward_count + 1, error_message = '' "
+            "WHERE id = ?", (now, tid)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: API Key Authentication & Rate Limiting
+# ---------------------------------------------------------------------------
+_rate_limit_cache = {}  # key_hash -> [timestamps]
+_rate_limit_lock = threading.Lock()
+
+
+def generate_api_key():
+    """Generate a new API key. Returns (raw_key, key_hash, key_prefix)."""
+    raw = "slk_" + secrets.token_hex(24)
+    key_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    prefix = raw[:12] + "..."
+    return raw, key_hash, prefix
+
+
+def validate_api_key(raw_key):
+    """Validate an API key. Returns the DB row or None."""
+    if not raw_key or not isinstance(raw_key, str):
+        return None
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ? AND enabled = 1",
+            (key_hash,)
+        ).fetchone()
+        if row:
+            # Check expiration
+            if row["expires_at"]:
+                now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                if row["expires_at"] < now_str:
+                    conn.close()
+                    return None
+            # Update usage
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE api_keys SET last_used = ?, use_count = use_count + 1 "
+                "WHERE id = ?", (now, row["id"])
+            )
+            conn.commit()
+        conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def check_rate_limit(key_hash, limit_per_minute=120):
+    """Check if a key has exceeded its rate limit. Returns True if allowed."""
+    now = time.time()
+    with _rate_limit_lock:
+        timestamps = _rate_limit_cache.get(key_hash, [])
+        # Clean old entries (older than 60s)
+        timestamps = [t for t in timestamps if now - t < 60]
+        if len(timestamps) >= limit_per_minute:
+            _rate_limit_cache[key_hash] = timestamps
+            return False
+        timestamps.append(now)
+        _rate_limit_cache[key_hash] = timestamps
+        return True
+
+
+def optional_api_auth(f):
+    """Decorator: if API auth is enabled, require a valid API key.
+    Key can be passed as X-API-Key header or ?api_key= query param."""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        with _config_lock:
+            auth_enabled = _config.get("api_auth", {}).get("enabled", False)
+        if not auth_enabled:
+            return f(*args, **kwargs)
+
+        key = request.headers.get("X-API-Key", "") or request.args.get("api_key", "")
+        if not key:
+            return jsonify({
+                "error": "api_key_required",
+                "message": "API key required. Pass via X-API-Key header or api_key param.",
+            }), 401
+
+        row = validate_api_key(key)
+        if not row:
+            return jsonify({
+                "error": "invalid_api_key",
+                "message": "Invalid or expired API key.",
+            }), 401
+
+        # Rate limit
+        limit = row.get("rate_limit", 120)
+        if not check_rate_limit(row["key_hash"], limit):
+            return jsonify({
+                "error": "rate_limited",
+                "message": "Rate limit exceeded. Max %d requests/minute." % limit,
+            }), 429
+
+        # Check permissions for write endpoints
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            if row.get("permissions", "read") == "read":
+                return jsonify({
+                    "error": "insufficient_permissions",
+                    "message": "This API key has read-only permissions.",
+                }), 403
+
+        request.api_key_info = row
+        return f(*args, **kwargs)
+    return wrapper
 
 
 def _buffer_flush_loop():
@@ -4296,6 +5196,583 @@ if HAS_FLASK:
         conn.close()
         return jsonify({"status": "deleted"})
 
+    # ---- Phase 5: Notification Channel endpoints ----
+    @app.route("/api/notifications/channels")
+    @require_tier(TIER_PRO)
+    def api_notification_channels():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM notification_channels ORDER BY id"
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                cfg = json_mod.loads(d.get("config", "{}"))
+                # Mask passwords
+                if "password" in cfg:
+                    cfg["password"] = "***" if cfg["password"] else ""
+                d["config_display"] = cfg
+            except Exception:
+                d["config_display"] = {}
+            result.append(d)
+        return jsonify({"channels": result})
+
+    @app.route("/api/notifications/channels", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_create_notification_channel():
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        name = data.get("name", "Untitled")
+        ch_type = data.get("channel_type", "email")
+        config = json_mod.dumps(data.get("config", {}))
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO notification_channels "
+            "(name, channel_type, config, enabled, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (name, ch_type, config, now)
+        )
+        conn.commit()
+        cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return jsonify({"status": "created", "id": cid})
+
+    @app.route("/api/notifications/channels/<int:cid>", methods=["PUT"])
+    @require_tier(TIER_PRO)
+    def api_update_notification_channel(cid):
+        data = request.get_json(force=True)
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM notification_channels WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not_found"}), 404
+        name = data.get("name", row["name"])
+        ch_type = data.get("channel_type", row["channel_type"])
+        enabled = data.get("enabled", row["enabled"])
+        if "config" in data:
+            config = json_mod.dumps(data["config"])
+        else:
+            config = row["config"]
+        conn.execute(
+            "UPDATE notification_channels SET name=?, channel_type=?, "
+            "config=?, enabled=? WHERE id=?",
+            (name, ch_type, config, int(enabled), cid)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/notifications/channels/<int:cid>", methods=["DELETE"])
+    @require_tier(TIER_PRO)
+    def api_delete_notification_channel(cid):
+        conn = get_db()
+        conn.execute("DELETE FROM notification_channels WHERE id = ?", (cid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
+    @app.route("/api/notifications/channels/<int:cid>/test", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_test_notification_channel(cid):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM notification_channels WHERE id = ?", (cid,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "not_found"}), 404
+        try:
+            cfg = json_mod.loads(row["config"]) if row["config"] else {}
+        except Exception:
+            cfg = {}
+        if row["channel_type"] == "email":
+            recipients = cfg.get("recipients", [])
+            if not recipients:
+                with _config_lock:
+                    recipients = _config.get("alerting", {}).get(
+                        "email", {}).get("recipients", [])
+            if not recipients:
+                return jsonify({"status": "error",
+                                "message": "No recipients configured"})
+            with _config_lock:
+                ecfg = _config.get("alerting", {}).get("email", {})
+            ok, err = _send_email(
+                cfg.get("smtp_host", ecfg.get("smtp_host", "")),
+                cfg.get("smtp_port", ecfg.get("smtp_port", 587)),
+                cfg.get("use_tls", ecfg.get("use_tls", True)),
+                cfg.get("username", ecfg.get("username", "")),
+                cfg.get("password", ecfg.get("password", "")),
+                cfg.get("from_addr", ecfg.get("from_addr", "")),
+                recipients,
+                "[SentryLog] Test Notification",
+                "<h2>Test notification from SentryLog</h2>"
+                "<p>If you see this, email notifications are working.</p>"
+            )
+            if ok:
+                return jsonify({"status": "ok", "message": "Test email sent"})
+            return jsonify({"status": "error", "message": err})
+        elif row["channel_type"] == "webhook":
+            url = cfg.get("url", "")
+            if not url:
+                return jsonify({"status": "error", "message": "No webhook URL"})
+            ok, err = _send_webhook(url, {
+                "product": "SentryLog", "event": "test",
+                "message": "Test notification from SentryLog"
+            })
+            if ok:
+                return jsonify({"status": "ok", "message": "Test webhook sent"})
+            return jsonify({"status": "error", "message": err})
+        return jsonify({"status": "error", "message": "Unknown channel type"})
+
+    @app.route("/api/notifications/log")
+    @require_tier(TIER_PRO)
+    def api_notification_log():
+        limit = request.args.get("limit", 50, type=int)
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT ?",
+            (min(limit, 500),)
+        ).fetchall()
+        conn.close()
+        return jsonify({"log": [dict(r) for r in rows]})
+
+    # ---- Phase 5: Scheduled Reports endpoints ----
+    @app.route("/api/scheduled-reports")
+    @require_tier(TIER_ENT)
+    def api_scheduled_reports():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM scheduled_reports ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return jsonify({"reports": [dict(r) for r in rows]})
+
+    @app.route("/api/scheduled-reports", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_create_scheduled_report():
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        name = data.get("name", "Untitled Schedule")
+        template = data.get("template", "custom")
+        schedule = data.get("schedule", "weekly")
+        recipients = json_mod.dumps(data.get("recipients", []))
+        params = json_mod.dumps(data.get("parameters", {}))
+        next_run = _compute_next_run(schedule)
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO scheduled_reports "
+            "(name, template, schedule, recipients, parameters, "
+            " enabled, next_run, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (name, template, schedule, recipients, params, next_run, now, now)
+        )
+        conn.commit()
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return jsonify({"status": "created", "id": rid, "next_run": next_run})
+
+    @app.route("/api/scheduled-reports/<int:sid>", methods=["PUT"])
+    @require_tier(TIER_ENT)
+    def api_update_scheduled_report(sid):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM scheduled_reports WHERE id = ?", (sid,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not_found"}), 404
+        name = data.get("name", row["name"])
+        template = data.get("template", row["template"])
+        schedule = data.get("schedule", row["schedule"])
+        enabled = data.get("enabled", row["enabled"])
+        if "recipients" in data:
+            recipients = json_mod.dumps(data["recipients"])
+        else:
+            recipients = row["recipients"]
+        if "parameters" in data:
+            params = json_mod.dumps(data["parameters"])
+        else:
+            params = row["parameters"]
+        next_run = _compute_next_run(schedule) if schedule != row["schedule"] else row["next_run"]
+        conn.execute(
+            "UPDATE scheduled_reports SET name=?, template=?, schedule=?, "
+            "recipients=?, parameters=?, enabled=?, next_run=?, updated_at=? "
+            "WHERE id=?",
+            (name, template, schedule, recipients, params, int(enabled),
+             next_run, now, sid)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/scheduled-reports/<int:sid>", methods=["DELETE"])
+    @require_tier(TIER_ENT)
+    def api_delete_scheduled_report(sid):
+        conn = get_db()
+        conn.execute("DELETE FROM scheduled_reports WHERE id = ?", (sid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
+    # ---- Phase 5: Log Export endpoint ----
+    @app.route("/api/logs/export")
+    @require_tier(TIER_PRO)
+    def api_logs_export():
+        """Export filtered logs as CSV or JSON."""
+        fmt = request.args.get("format", "csv")
+        severity = request.args.get("severity", "")
+        source = request.args.get("source", "")
+        search = request.args.get("search", "")
+        hours = request.args.get("hours", 24, type=int)
+        limit = request.args.get("limit", 10000, type=int)
+
+        cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        where = ["received_at >= ?"]
+        params = [cutoff]
+        if severity:
+            sevs = [s.strip().lower() for s in severity.split(",")]
+            ph = ",".join(["?"] * len(sevs))
+            where.append("severity IN (%s)" % ph)
+            params.extend(sevs)
+        if source:
+            where.append("(source_ip = ? OR source_name = ?)")
+            params.extend([source, source])
+        if search:
+            where.append("(message LIKE ? OR app_name LIKE ?)")
+            like = "%" + search + "%"
+            params.extend([like, like])
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT timestamp, source_ip, source_name, severity, facility, "
+            "app_name, process_id, message FROM logs WHERE %s "
+            "ORDER BY timestamp DESC LIMIT ?"
+            % " AND ".join(where),
+            params + [min(limit, 50000)]
+        ).fetchall()
+        conn.close()
+
+        if fmt == "json":
+            data = json_mod.dumps([dict(r) for r in rows], indent=2)
+            return Response(
+                data, mimetype="application/json",
+                headers={"Content-Disposition": "attachment; filename=sentrylog_export.json"}
+            )
+        else:
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["timestamp", "source_ip", "source_name",
+                             "severity", "facility", "app_name",
+                             "process_id", "message"])
+            for r in rows:
+                writer.writerow([r["timestamp"], r["source_ip"],
+                                 r["source_name"], r["severity"],
+                                 r["facility"], r["app_name"],
+                                 r["process_id"], r["message"]])
+            csv_data = output.getvalue()
+            return Response(
+                csv_data, mimetype="text/csv",
+                headers={"Content-Disposition": "attachment; filename=sentrylog_export.csv"}
+            )
+
+    # ---- Phase 6: File Target endpoints ----
+    @app.route("/api/file-targets")
+    @require_tier(TIER_PRO)
+    def api_file_targets():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM file_targets ORDER BY id"
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["running"] = r["id"] in _file_tail_threads
+            result.append(d)
+        return jsonify({"targets": result})
+
+    @app.route("/api/file-targets", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_create_file_target():
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        fp = data.get("file_path", "")
+        if not fp:
+            return jsonify({"error": "file_path required"}), 400
+        name = data.get("name", os.path.basename(fp))
+        src = data.get("source_name", name)
+        fmt = data.get("parse_format", "auto")
+        fac = data.get("default_facility", "local0")
+        sev = data.get("default_severity", "info")
+
+        # Check tier limits
+        features = get_tier_features()
+        conn = get_db()
+        count = conn.execute("SELECT COUNT(*) FROM file_targets").fetchone()[0]
+        if count >= features.get("max_file_targets", 0):
+            conn.close()
+            return jsonify({"error": "limit_reached",
+                            "message": "File target limit reached for your tier"}), 403
+
+        conn.execute(
+            "INSERT INTO file_targets "
+            "(name, file_path, parse_format, source_name, default_facility, "
+            " default_severity, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (name, fp, fmt, src, fac, sev, now, now)
+        )
+        conn.commit()
+        tid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        target = conn.execute(
+            "SELECT * FROM file_targets WHERE id = ?", (tid,)
+        ).fetchone()
+        conn.close()
+
+        # Start tailing
+        start_file_tail(dict(target))
+        return jsonify({"status": "created", "id": tid})
+
+    @app.route("/api/file-targets/<int:tid>", methods=["PUT"])
+    @require_tier(TIER_PRO)
+    def api_update_file_target(tid):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM file_targets WHERE id = ?", (tid,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not_found"}), 404
+        name = data.get("name", row["name"])
+        fp = data.get("file_path", row["file_path"])
+        src = data.get("source_name", row["source_name"])
+        fmt = data.get("parse_format", row["parse_format"])
+        fac = data.get("default_facility", row["default_facility"])
+        sev = data.get("default_severity", row["default_severity"])
+        enabled = data.get("enabled", row["enabled"])
+        conn.execute(
+            "UPDATE file_targets SET name=?, file_path=?, source_name=?, "
+            "parse_format=?, default_facility=?, default_severity=?, "
+            "enabled=?, updated_at=? WHERE id=?",
+            (name, fp, src, fmt, fac, sev, int(enabled), now, tid)
+        )
+        conn.commit()
+        conn.close()
+
+        # Restart if running
+        stop_file_tail(tid)
+        if enabled:
+            target = {"id": tid, "file_path": fp, "source_name": src,
+                       "default_facility": fac, "default_severity": sev}
+            start_file_tail(target)
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/file-targets/<int:tid>", methods=["DELETE"])
+    @require_tier(TIER_PRO)
+    def api_delete_file_target(tid):
+        stop_file_tail(tid)
+        conn = get_db()
+        conn.execute("DELETE FROM file_targets WHERE id = ?", (tid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
+    # ---- Phase 6: Forwarding Target endpoints ----
+    @app.route("/api/forwarding-targets")
+    @require_tier(TIER_PRO)
+    def api_forwarding_targets():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM forwarding_targets ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return jsonify({"targets": [dict(r) for r in rows]})
+
+    @app.route("/api/forwarding-targets", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_create_forwarding_target():
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        name = data.get("name", "Untitled")
+        ttype = data.get("target_type", "syslog")
+        host = data.get("host", "")
+        port = data.get("port", 514)
+        protocol = data.get("protocol", "udp")
+        wh_url = data.get("webhook_url", "")
+        fsev = data.get("filter_severity", "")
+        fsrc = data.get("filter_source", "")
+        ffac = data.get("filter_facility", "")
+        fmt = data.get("format", "rfc3164")
+
+        features = get_tier_features()
+        conn = get_db()
+        count = conn.execute("SELECT COUNT(*) FROM forwarding_targets").fetchone()[0]
+        if count >= features.get("max_forwarding_targets", 0):
+            conn.close()
+            return jsonify({"error": "limit_reached",
+                            "message": "Forwarding target limit reached"}), 403
+
+        conn.execute(
+            "INSERT INTO forwarding_targets "
+            "(name, target_type, host, port, protocol, webhook_url, "
+            " filter_severity, filter_source, filter_facility, format, "
+            " enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (name, ttype, host, port, protocol, wh_url,
+             fsev, fsrc, ffac, fmt, now, now)
+        )
+        conn.commit()
+        fid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return jsonify({"status": "created", "id": fid})
+
+    @app.route("/api/forwarding-targets/<int:fid>", methods=["PUT"])
+    @require_tier(TIER_PRO)
+    def api_update_forwarding_target(fid):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM forwarding_targets WHERE id = ?", (fid,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not_found"}), 404
+        fields = ["name", "target_type", "host", "port", "protocol",
+                   "webhook_url", "filter_severity", "filter_source",
+                   "filter_facility", "format", "enabled"]
+        vals = []
+        sets = []
+        for f in fields:
+            if f in data:
+                sets.append("%s = ?" % f)
+                vals.append(data[f] if f != "enabled" else int(data[f]))
+            else:
+                sets.append("%s = ?" % f)
+                vals.append(row[f])
+        sets.append("updated_at = ?")
+        vals.append(now)
+        vals.append(fid)
+        conn.execute(
+            "UPDATE forwarding_targets SET %s WHERE id = ?" % ", ".join(sets),
+            vals
+        )
+        conn.commit()
+        conn.close()
+        # Clear cached socket
+        with _forwarding_lock:
+            sock = _forwarding_sockets.pop(fid, None)
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/forwarding-targets/<int:fid>", methods=["DELETE"])
+    @require_tier(TIER_PRO)
+    def api_delete_forwarding_target(fid):
+        conn = get_db()
+        conn.execute("DELETE FROM forwarding_targets WHERE id = ?", (fid,))
+        conn.commit()
+        conn.close()
+        with _forwarding_lock:
+            sock = _forwarding_sockets.pop(fid, None)
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        return jsonify({"status": "deleted"})
+
+    # ---- Phase 6: API Key endpoints ----
+    @app.route("/api/api-keys")
+    @require_tier(TIER_PRO)
+    def api_list_api_keys():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, key_prefix, label, permissions, enabled, "
+            "last_used, use_count, rate_limit, created_at, expires_at "
+            "FROM api_keys ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return jsonify({"keys": [dict(r) for r in rows]})
+
+    @app.route("/api/api-keys", methods=["POST"])
+    @require_tier(TIER_PRO)
+    def api_create_api_key():
+        data = request.get_json(force=True)
+        label = data.get("label", "Untitled Key")
+        permissions = data.get("permissions", "read")
+        rate_limit = data.get("rate_limit", 120)
+        expires_days = data.get("expires_days", 0)
+
+        raw_key, key_hash, prefix = generate_api_key()
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        expires = ""
+        if expires_days > 0:
+            exp_dt = datetime.datetime.utcnow() + datetime.timedelta(days=expires_days)
+            expires = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO api_keys "
+            "(key_hash, key_prefix, label, permissions, enabled, "
+            " rate_limit, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (key_hash, prefix, label, permissions, rate_limit, now, expires)
+        )
+        conn.commit()
+        kid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        # Return the raw key ONCE -- it cannot be retrieved later
+        return jsonify({
+            "status": "created", "id": kid,
+            "api_key": raw_key,
+            "warning": "Save this key now. It cannot be retrieved again.",
+        })
+
+    @app.route("/api/api-keys/<int:kid>", methods=["PUT"])
+    @require_tier(TIER_PRO)
+    def api_update_api_key(kid):
+        data = request.get_json(force=True)
+        conn = get_db()
+        row = conn.execute("SELECT * FROM api_keys WHERE id = ?", (kid,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not_found"}), 404
+        label = data.get("label", row["label"])
+        permissions = data.get("permissions", row["permissions"])
+        enabled = data.get("enabled", row["enabled"])
+        rate_limit = data.get("rate_limit", row["rate_limit"])
+        conn.execute(
+            "UPDATE api_keys SET label=?, permissions=?, enabled=?, rate_limit=? "
+            "WHERE id=?",
+            (label, permissions, int(enabled), rate_limit, kid)
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/api-keys/<int:kid>", methods=["DELETE"])
+    @require_tier(TIER_PRO)
+    def api_delete_api_key(kid):
+        conn = get_db()
+        conn.execute("DELETE FROM api_keys WHERE id = ?", (kid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "deleted"})
+
     # ---- Test / Utility ----
     @app.route("/api/test-log", methods=["POST"])
     def api_test_log():
@@ -4357,6 +5834,10 @@ def main():
     else:
         print("  [--] requests not found -- security API connectors disabled")
         print("       Install: pip install requests")
+    print("  [OK] Email notifications (SMTP) available")
+    print("  [OK] Log file tailing (Linux/Mac) available")
+    print("  [OK] Log forwarding to external SIEM available")
+    print("  [OK] API key authentication available")
     print()
 
     # Load config
@@ -4417,6 +5898,14 @@ def main():
     corr_thread.start()
     log.info("Correlation engine started (30s check interval)")
 
+    # Start Scheduled Report Engine (Phase 5)
+    sched_thread = threading.Thread(target=_scheduled_report_loop, daemon=True)
+    sched_thread.start()
+    log.info("Scheduled report engine started (60s check interval)")
+
+    # Start Log File Tailers (Phase 6)
+    _start_all_file_tails()
+
     # Start dashboard
     if HAS_FLASK:
         dash_cfg = cfg.get("dashboard", {})
@@ -4439,6 +5928,10 @@ def main():
             pass
 
     _running = False
+    _stop_event.set()
+    # Stop all file tailers
+    for tid in list(_file_tail_stops.keys()):
+        stop_file_tail(tid)
     log.info("SentryLog shutting down...")
 
 

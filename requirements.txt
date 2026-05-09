@@ -1,4 +1,4 @@
-# MyClover.Tech.SentryLog v4.0 - Requirements
+# MyClover.Tech.SentryLog v6.0 - Requirements
 # Core dependencies (required)
 flask>=3.0.0
 pyyaml>=6.0
@@ -14,4 +14,7 @@ pyyaml>=6.0
 #   pip install requests
 
 # Phase 4: Correlation + Compliance (no extra dependencies)
-# Uses built-in threading and SQLite. All features included in core.
+# Phase 5: Email notifications (built-in smtplib), scheduled reports, log export
+# Phase 6: File tailing, log forwarding, API keys (no extra dependencies)
+#
+# All Phase 4-6 features use Python stdlib + SQLite. No extra installs needed.

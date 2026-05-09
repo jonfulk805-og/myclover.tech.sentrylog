@@ -510,6 +510,10 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <button class="nav-tab" data-tab="connectors">Security Connectors</button>
     <button class="nav-tab" data-tab="correlation">Correlation</button>
     <button class="nav-tab" data-tab="compliance">Compliance</button>
+    <button class="nav-tab" data-tab="filetargets">Log Files</button>
+    <button class="nav-tab" data-tab="notifications">Notifications</button>
+    <button class="nav-tab" data-tab="forwarding">Forwarding</button>
+    <button class="nav-tab" data-tab="apikeys">API Keys</button>
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
   <div class="nav-right">
@@ -597,6 +601,8 @@ tr:hover td { background: rgba(34,197,94,0.03); }
         <span class="live-dot" id="liveDot"></span> Live
       </button>
       <button class="btn btn-primary btn-sm" onclick="openTestLogModal()">+ Test Log</button>
+      <button class="btn btn-sm" onclick="exportLogs('csv')" title="Export CSV">Export CSV</button>
+      <button class="btn btn-sm" onclick="exportLogs('json')" title="Export JSON">Export JSON</button>
     </div>
     <div class="log-table-wrap" style="max-height: calc(100vh - 220px); overflow-y: auto;">
       <table>
@@ -863,6 +869,181 @@ tr:hover td { background: rgba(34,197,94,0.03); }
       <div id="complianceReportList">
         <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No reports generated yet.</div>
       </div>
+    </div>
+  </div>
+
+  <!-- ==================== LOG FILES TAB (Phase 6) ==================== -->
+  <div class="tab-panel" id="tab-filetargets">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Log File Targets (Linux / Mac)</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm" onclick="refreshFileTargets()">Refresh</button>
+          <button class="btn btn-sm btn-primary" onclick="showAddFileTarget()">+ Add File Target</button>
+        </div>
+      </div>
+      <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px">
+        Tail log files on this machine. Supports syslog-style and ISO-timestamped log files.
+        Common paths: <code>/var/log/syslog</code>, <code>/var/log/auth.log</code>, <code>/var/log/messages</code>, <code>/var/log/secure</code>
+      </p>
+      <div id="fileTargetList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No file targets configured. Click + Add File Target to start.</div>
+      </div>
+    </div>
+    <div class="card" id="addFileTargetForm" style="display:none">
+      <div class="card-title" style="margin-bottom:12px">Add File Target</div>
+      <div class="settings-row"><label>Name:</label><input type="text" id="ftName" placeholder="auth-log"></div>
+      <div class="settings-row"><label>File Path:</label><input type="text" id="ftPath" placeholder="/var/log/auth.log"></div>
+      <div class="settings-row"><label>Source Name:</label><input type="text" id="ftSource" placeholder="(auto from filename)"></div>
+      <div class="settings-row"><label>Default Facility:</label>
+        <select id="ftFacility"><option value="local0">local0</option><option value="local1">local1</option>
+        <option value="auth">auth</option><option value="syslog">syslog</option><option value="daemon">daemon</option>
+        <option value="kern">kern</option><option value="user">user</option></select>
+      </div>
+      <div class="settings-row"><label>Default Severity:</label>
+        <select id="ftSeverity"><option value="info">info</option><option value="warning">warning</option>
+        <option value="error">error</option><option value="debug">debug</option><option value="notice">notice</option></select>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-primary" onclick="createFileTarget()">Create</button>
+        <button class="btn btn-sm" onclick="document.getElementById('addFileTargetForm').style.display='none'">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== NOTIFICATIONS TAB (Phase 5) ==================== -->
+  <div class="tab-panel" id="tab-notifications">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Notification Channels</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm" onclick="refreshNotifications()">Refresh</button>
+          <button class="btn btn-sm btn-primary" onclick="showAddNotifChannel()">+ Add Channel</button>
+        </div>
+      </div>
+      <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px">
+        Receive alerts via email (SMTP) or webhook when alert rules fire. Pro tier and above.
+      </p>
+      <div id="notifChannelList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No notification channels configured.</div>
+      </div>
+    </div>
+    <div class="card" id="addNotifForm" style="display:none">
+      <div class="card-title" style="margin-bottom:12px">Add Notification Channel</div>
+      <div class="settings-row"><label>Name:</label><input type="text" id="notifName" placeholder="Ops Email"></div>
+      <div class="settings-row"><label>Type:</label>
+        <select id="notifType" onchange="toggleNotifFields()">
+          <option value="email">Email (SMTP)</option>
+          <option value="webhook">Webhook (HTTP POST)</option>
+        </select>
+      </div>
+      <div id="notifEmailFields">
+        <div class="settings-row"><label>SMTP Host:</label><input type="text" id="notifSmtp" placeholder="smtp.gmail.com"></div>
+        <div class="settings-row"><label>SMTP Port:</label><input type="number" id="notifSmtpPort" value="587"></div>
+        <div class="settings-row"><label>Username:</label><input type="text" id="notifUser" placeholder="user@example.com"></div>
+        <div class="settings-row"><label>Password:</label><input type="password" id="notifPass"></div>
+        <div class="settings-row"><label>From Address:</label><input type="text" id="notifFrom" placeholder="sentrylog@yourdomain.com"></div>
+        <div class="settings-row"><label>Recipients (comma-sep):</label><input type="text" id="notifRecipients" placeholder="admin@company.com, ops@company.com"></div>
+      </div>
+      <div id="notifWebhookFields" style="display:none">
+        <div class="settings-row"><label>Webhook URL:</label><input type="text" id="notifWebhookUrl" placeholder="https://hooks.slack.com/..."></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-primary" onclick="createNotifChannel()">Create</button>
+        <button class="btn btn-sm" onclick="document.getElementById('addNotifForm').style.display='none'">Cancel</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px">Notification Log</div>
+      <div id="notifLogList">
+        <div style="color:var(--text-dim);font-size:13px;text-align:center;padding:12px">No notifications sent yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== FORWARDING TAB (Phase 6) ==================== -->
+  <div class="tab-panel" id="tab-forwarding">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Log Forwarding Targets</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm" onclick="refreshForwarding()">Refresh</button>
+          <button class="btn btn-sm btn-primary" onclick="showAddForwarding()">+ Add Target</button>
+        </div>
+      </div>
+      <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px">
+        Forward processed logs to an external syslog server, SIEM, or webhook endpoint. Apply filters to forward only matching logs.
+      </p>
+      <div id="forwardingList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No forwarding targets configured.</div>
+      </div>
+    </div>
+    <div class="card" id="addForwardingForm" style="display:none">
+      <div class="card-title" style="margin-bottom:12px">Add Forwarding Target</div>
+      <div class="settings-row"><label>Name:</label><input type="text" id="fwdName" placeholder="Central SIEM"></div>
+      <div class="settings-row"><label>Type:</label>
+        <select id="fwdType" onchange="toggleFwdFields()">
+          <option value="syslog">Syslog (UDP/TCP)</option>
+          <option value="webhook">Webhook (HTTP POST)</option>
+        </select>
+      </div>
+      <div id="fwdSyslogFields">
+        <div class="settings-row"><label>Host:</label><input type="text" id="fwdHost" placeholder="siem.company.com"></div>
+        <div class="settings-row"><label>Port:</label><input type="number" id="fwdPort" value="514"></div>
+        <div class="settings-row"><label>Protocol:</label>
+          <select id="fwdProto"><option value="udp">UDP</option><option value="tcp">TCP</option></select>
+        </div>
+        <div class="settings-row"><label>Format:</label>
+          <select id="fwdFormat"><option value="rfc3164">RFC 3164 (BSD)</option><option value="rfc5424">RFC 5424</option></select>
+        </div>
+      </div>
+      <div id="fwdWebhookFields" style="display:none">
+        <div class="settings-row"><label>Webhook URL:</label><input type="text" id="fwdWebhookUrl" placeholder="https://..."></div>
+      </div>
+      <div class="settings-row"><label>Filter Severity (optional):</label><input type="text" id="fwdFilterSev" placeholder="critical,error,warning"></div>
+      <div class="settings-row"><label>Filter Source (optional):</label><input type="text" id="fwdFilterSrc" placeholder="10.0.0.1,firewall"></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-primary" onclick="createForwardingTarget()">Create</button>
+        <button class="btn btn-sm" onclick="document.getElementById('addForwardingForm').style.display='none'">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== API KEYS TAB (Phase 6) ==================== -->
+  <div class="tab-panel" id="tab-apikeys">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">API Key Management</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm" onclick="refreshApiKeys()">Refresh</button>
+          <button class="btn btn-sm btn-primary" onclick="showAddApiKey()">+ Generate Key</button>
+        </div>
+      </div>
+      <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px">
+        Generate API keys for programmatic access. Pass via <code>X-API-Key</code> header or <code>?api_key=</code> query param.
+        Enable API auth in Settings to require keys for all API calls.
+      </p>
+      <div id="apiKeyList">
+        <div class="card" style="text-align:center; color:var(--text-dim); padding:20px; font-size:13px">No API keys generated.</div>
+      </div>
+    </div>
+    <div class="card" id="addApiKeyForm" style="display:none">
+      <div class="card-title" style="margin-bottom:12px">Generate API Key</div>
+      <div class="settings-row"><label>Label:</label><input type="text" id="akLabel" placeholder="CI Pipeline Key"></div>
+      <div class="settings-row"><label>Permissions:</label>
+        <select id="akPerms"><option value="read">Read Only</option><option value="full">Full Access</option></select>
+      </div>
+      <div class="settings-row"><label>Rate Limit (req/min):</label><input type="number" id="akRate" value="120"></div>
+      <div class="settings-row"><label>Expires (days, 0=never):</label><input type="number" id="akExpires" value="0"></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-primary" onclick="createApiKey()">Generate</button>
+        <button class="btn btn-sm" onclick="document.getElementById('addApiKeyForm').style.display='none'">Cancel</button>
+      </div>
+    </div>
+    <div class="card" id="newKeyDisplay" style="display:none;border:1px solid var(--green)">
+      <div class="card-title" style="color:var(--green);margin-bottom:8px">New API Key Generated</div>
+      <p style="color:var(--warn);font-size:13px;margin-bottom:8px">Copy this key now. It will not be shown again.</p>
+      <code id="newKeyValue" style="display:block;padding:12px;background:var(--bg);border-radius:6px;font-size:14px;word-break:break-all;color:var(--green);user-select:all"></code>
     </div>
   </div>
 
@@ -1319,6 +1500,10 @@ function switchTab(tab) {
   if (tab === 'connectors') loadConnectorsTab();
   if (tab === 'correlation') loadCorrelationTab();
   if (tab === 'compliance') loadComplianceTab();
+  if (tab === 'filetargets') refreshFileTargets();
+  if (tab === 'notifications') refreshNotifications();
+  if (tab === 'forwarding') refreshForwarding();
+  if (tab === 'apikeys') refreshApiKeys();
   if (tab === 'settings') loadSettings();
 }
 
@@ -2612,6 +2797,258 @@ function debounce(fn, ms) {
     clearTimeout(timer);
     timer = setTimeout(fn, ms);
   };
+}
+
+// ============= Phase 5: Log Export =============
+function exportLogs(fmt) {
+  var sev = document.getElementById('logSeverity').value;
+  var src = document.getElementById('logSource').value;
+  var search = document.getElementById('logSearch').value;
+  var hours = document.getElementById('logHours').value;
+  var url = '/api/logs/export?format=' + fmt + '&hours=' + hours;
+  if (sev) url += '&severity=' + encodeURIComponent(sev);
+  if (src) url += '&source=' + encodeURIComponent(src);
+  if (search) url += '&search=' + encodeURIComponent(search);
+  window.open(url, '_blank');
+}
+
+// ============= Phase 5: Notifications =============
+function refreshNotifications() {
+  api('/api/notifications/channels').then(function(d) {
+    var el = document.getElementById('notifChannelList');
+    if (!d.channels || !d.channels.length) {
+      el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No notification channels configured.</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Last Sent</th><th>Count</th><th>Actions</th></tr></thead><tbody>';
+    d.channels.forEach(function(c) {
+      var status = c.enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--text-dim)">Disabled</span>';
+      h += '<tr><td>' + esc(c.name) + '</td><td>' + esc(c.channel_type) + '</td>';
+      h += '<td>' + status + '</td><td>' + esc(c.last_sent || '-') + '</td>';
+      h += '<td>' + (c.send_count||0) + '</td>';
+      h += '<td><button class="btn btn-sm" onclick="testNotifChannel(' + c.id + ')">Test</button> ';
+      h += '<button class="btn btn-sm" onclick="toggleNotifEnabled(' + c.id + ',' + (c.enabled?0:1) + ')">' + (c.enabled?'Disable':'Enable') + '</button> ';
+      h += '<button class="btn btn-sm btn-danger" onclick="deleteNotifChannel(' + c.id + ')">Delete</button></td></tr>';
+    });
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }).catch(function() {
+    document.getElementById('notifChannelList').innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:20px;font-size:13px">Requires Pro tier or above.</div>';
+  });
+  // Load notification log
+  api('/api/notifications/log').then(function(d) {
+    var el = document.getElementById('notifLogList');
+    if (!d.log || !d.log.length) {
+      el.innerHTML = '<div style="color:var(--text-dim);font-size:13px;text-align:center;padding:12px">No notifications sent yet.</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>Time</th><th>Channel</th><th>Subject</th><th>Status</th></tr></thead><tbody>';
+    d.log.slice(0,30).forEach(function(n) {
+      var sc = n.status === 'sent' ? 'color:var(--green)' : 'color:var(--danger)';
+      h += '<tr><td>' + esc(n.sent_at) + '</td><td>' + esc(n.channel_name) + '</td>';
+      h += '<td>' + esc(n.subject) + '</td><td style="' + sc + '">' + esc(n.status) + '</td></tr>';
+    });
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }).catch(function(){});
+}
+function showAddNotifChannel() { document.getElementById('addNotifForm').style.display = 'block'; }
+function toggleNotifFields() {
+  var t = document.getElementById('notifType').value;
+  document.getElementById('notifEmailFields').style.display = t === 'email' ? 'block' : 'none';
+  document.getElementById('notifWebhookFields').style.display = t === 'webhook' ? 'block' : 'none';
+}
+function createNotifChannel() {
+  var t = document.getElementById('notifType').value;
+  var cfg = {};
+  if (t === 'email') {
+    cfg = {
+      smtp_host: document.getElementById('notifSmtp').value,
+      smtp_port: parseInt(document.getElementById('notifSmtpPort').value) || 587,
+      username: document.getElementById('notifUser').value,
+      password: document.getElementById('notifPass').value,
+      from_addr: document.getElementById('notifFrom').value,
+      recipients: document.getElementById('notifRecipients').value.split(',').map(function(s){return s.trim()}).filter(Boolean)
+    };
+  } else {
+    cfg = { url: document.getElementById('notifWebhookUrl').value };
+  }
+  api('/api/notifications/channels', 'POST', {
+    name: document.getElementById('notifName').value || 'Untitled',
+    channel_type: t,
+    config: cfg
+  }).then(function() {
+    document.getElementById('addNotifForm').style.display = 'none';
+    refreshNotifications();
+  });
+}
+function testNotifChannel(id) {
+  api('/api/notifications/channels/' + id + '/test', 'POST', {}).then(function(d) {
+    alert(d.status === 'ok' ? 'Test sent successfully!' : 'Error: ' + (d.message||'unknown'));
+  });
+}
+function toggleNotifEnabled(id, enabled) {
+  api('/api/notifications/channels/' + id, 'PUT', {enabled: enabled}).then(function() { refreshNotifications(); });
+}
+function deleteNotifChannel(id) {
+  if (!confirm('Delete this notification channel?')) return;
+  api('/api/notifications/channels/' + id, 'DELETE').then(function() { refreshNotifications(); });
+}
+
+// ============= Phase 6: File Targets =============
+function refreshFileTargets() {
+  api('/api/file-targets').then(function(d) {
+    var el = document.getElementById('fileTargetList');
+    if (!d.targets || !d.targets.length) {
+      el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No file targets configured. Click + Add File Target to start.</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>Name</th><th>File Path</th><th>Source</th><th>Status</th><th>Logs Read</th><th>Last Read</th><th>Actions</th></tr></thead><tbody>';
+    d.targets.forEach(function(t) {
+      var status = t.running ? '<span style="color:var(--green)">Running</span>' : '<span style="color:var(--text-dim)">Stopped</span>';
+      if (t.error_message) status = '<span style="color:var(--danger)" title="' + esc(t.error_message) + '">Error</span>';
+      h += '<tr><td>' + esc(t.name) + '</td><td><code>' + esc(t.file_path) + '</code></td>';
+      h += '<td>' + esc(t.source_name||'-') + '</td><td>' + status + '</td>';
+      h += '<td>' + (t.log_count||0) + '</td><td>' + esc(t.last_read||'-') + '</td>';
+      h += '<td><button class="btn btn-sm" onclick="toggleFileTarget(' + t.id + ',' + (t.enabled?0:1) + ')">' + (t.enabled?'Disable':'Enable') + '</button> ';
+      h += '<button class="btn btn-sm btn-danger" onclick="deleteFileTarget(' + t.id + ')">Delete</button></td></tr>';
+    });
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }).catch(function() {
+    document.getElementById('fileTargetList').innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:20px;font-size:13px">Requires Pro tier or above.</div>';
+  });
+}
+function showAddFileTarget() { document.getElementById('addFileTargetForm').style.display = 'block'; }
+function createFileTarget() {
+  api('/api/file-targets', 'POST', {
+    name: document.getElementById('ftName').value || '',
+    file_path: document.getElementById('ftPath').value,
+    source_name: document.getElementById('ftSource').value,
+    default_facility: document.getElementById('ftFacility').value,
+    default_severity: document.getElementById('ftSeverity').value
+  }).then(function() {
+    document.getElementById('addFileTargetForm').style.display = 'none';
+    refreshFileTargets();
+  });
+}
+function toggleFileTarget(id, enabled) {
+  api('/api/file-targets/' + id, 'PUT', {enabled: enabled}).then(function() { refreshFileTargets(); });
+}
+function deleteFileTarget(id) {
+  if (!confirm('Delete this file target?')) return;
+  api('/api/file-targets/' + id, 'DELETE').then(function() { refreshFileTargets(); });
+}
+
+// ============= Phase 6: Forwarding =============
+function refreshForwarding() {
+  api('/api/forwarding-targets').then(function(d) {
+    var el = document.getElementById('forwardingList');
+    if (!d.targets || !d.targets.length) {
+      el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No forwarding targets configured.</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>Name</th><th>Type</th><th>Destination</th><th>Filters</th><th>Forwarded</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+    d.targets.forEach(function(t) {
+      var dest = t.target_type === 'syslog' ? esc(t.host) + ':' + t.port + ' (' + esc(t.protocol) + ')' : esc(t.webhook_url||'');
+      var filters = [];
+      if (t.filter_severity) filters.push('sev:' + esc(t.filter_severity));
+      if (t.filter_source) filters.push('src:' + esc(t.filter_source));
+      var filterStr = filters.length ? filters.join(', ') : '<span style="color:var(--text-dim)">none</span>';
+      var status = t.enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--text-dim)">Disabled</span>';
+      if (t.error_message) status = '<span style="color:var(--danger)">Error</span>';
+      h += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.target_type) + '</td>';
+      h += '<td><code>' + dest + '</code></td><td>' + filterStr + '</td>';
+      h += '<td>' + (t.forward_count||0) + '</td><td>' + status + '</td>';
+      h += '<td><button class="btn btn-sm" onclick="toggleForwarding(' + t.id + ',' + (t.enabled?0:1) + ')">' + (t.enabled?'Disable':'Enable') + '</button> ';
+      h += '<button class="btn btn-sm btn-danger" onclick="deleteForwarding(' + t.id + ')">Delete</button></td></tr>';
+    });
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }).catch(function() {
+    document.getElementById('forwardingList').innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:20px;font-size:13px">Requires Pro tier or above.</div>';
+  });
+}
+function showAddForwarding() { document.getElementById('addForwardingForm').style.display = 'block'; }
+function toggleFwdFields() {
+  var t = document.getElementById('fwdType').value;
+  document.getElementById('fwdSyslogFields').style.display = t === 'syslog' ? 'block' : 'none';
+  document.getElementById('fwdWebhookFields').style.display = t === 'webhook' ? 'block' : 'none';
+}
+function createForwardingTarget() {
+  var t = document.getElementById('fwdType').value;
+  var body = {
+    name: document.getElementById('fwdName').value || 'Untitled',
+    target_type: t,
+    filter_severity: document.getElementById('fwdFilterSev').value,
+    filter_source: document.getElementById('fwdFilterSrc').value
+  };
+  if (t === 'syslog') {
+    body.host = document.getElementById('fwdHost').value;
+    body.port = parseInt(document.getElementById('fwdPort').value) || 514;
+    body.protocol = document.getElementById('fwdProto').value;
+    body.format = document.getElementById('fwdFormat').value;
+  } else {
+    body.webhook_url = document.getElementById('fwdWebhookUrl').value;
+  }
+  api('/api/forwarding-targets', 'POST', body).then(function() {
+    document.getElementById('addForwardingForm').style.display = 'none';
+    refreshForwarding();
+  });
+}
+function toggleForwarding(id, enabled) {
+  api('/api/forwarding-targets/' + id, 'PUT', {enabled: enabled}).then(function() { refreshForwarding(); });
+}
+function deleteForwarding(id) {
+  if (!confirm('Delete this forwarding target?')) return;
+  api('/api/forwarding-targets/' + id, 'DELETE').then(function() { refreshForwarding(); });
+}
+
+// ============= Phase 6: API Keys =============
+function refreshApiKeys() {
+  api('/api/api-keys').then(function(d) {
+    var el = document.getElementById('apiKeyList');
+    if (!d.keys || !d.keys.length) {
+      el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;font-size:13px">No API keys generated.</div>';
+      return;
+    }
+    var h = '<table><thead><tr><th>Label</th><th>Key Prefix</th><th>Permissions</th><th>Rate Limit</th><th>Last Used</th><th>Uses</th><th>Actions</th></tr></thead><tbody>';
+    d.keys.forEach(function(k) {
+      var status = k.enabled ? '' : ' <span style="color:var(--danger)">(disabled)</span>';
+      h += '<tr><td>' + esc(k.label) + status + '</td><td><code>' + esc(k.key_prefix) + '</code></td>';
+      h += '<td>' + esc(k.permissions) + '</td><td>' + (k.rate_limit||120) + '/min</td>';
+      h += '<td>' + esc(k.last_used||'-') + '</td><td>' + (k.use_count||0) + '</td>';
+      h += '<td><button class="btn btn-sm" onclick="toggleApiKey(' + k.id + ',' + (k.enabled?0:1) + ')">' + (k.enabled?'Revoke':'Enable') + '</button> ';
+      h += '<button class="btn btn-sm btn-danger" onclick="deleteApiKey(' + k.id + ')">Delete</button></td></tr>';
+    });
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }).catch(function() {
+    document.getElementById('apiKeyList').innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:20px;font-size:13px">Requires Pro tier or above.</div>';
+  });
+}
+function showAddApiKey() { document.getElementById('addApiKeyForm').style.display = 'block'; document.getElementById('newKeyDisplay').style.display = 'none'; }
+function createApiKey() {
+  api('/api/api-keys', 'POST', {
+    label: document.getElementById('akLabel').value || 'Untitled',
+    permissions: document.getElementById('akPerms').value,
+    rate_limit: parseInt(document.getElementById('akRate').value) || 120,
+    expires_days: parseInt(document.getElementById('akExpires').value) || 0
+  }).then(function(d) {
+    document.getElementById('addApiKeyForm').style.display = 'none';
+    if (d.api_key) {
+      document.getElementById('newKeyValue').textContent = d.api_key;
+      document.getElementById('newKeyDisplay').style.display = 'block';
+    }
+    refreshApiKeys();
+  });
+}
+function toggleApiKey(id, enabled) {
+  api('/api/api-keys/' + id, 'PUT', {enabled: enabled}).then(function() { refreshApiKeys(); });
+}
+function deleteApiKey(id) {
+  if (!confirm('Permanently delete this API key?')) return;
+  api('/api/api-keys/' + id, 'DELETE').then(function() { refreshApiKeys(); });
 }
 
 // ------- Init -------
