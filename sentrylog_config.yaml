@@ -1,0 +1,51 @@
+# ============================================================
+# MyClover.Tech.SentryLog v1.0 - Configuration
+# ============================================================
+# Log Aggregation & Security Alert Platform
+# Part of the MyClover.Tech suite
+# ============================================================
+
+# License key (leave blank for Community/free tier)
+# Purchase at myclover.tech to unlock Pro or Enterprise features.
+license_key: ""
+
+# Syslog Receiver Settings
+# Point your devices' syslog output at this server's IP on these ports.
+syslog:
+  udp_enabled: true
+  udp_port: 514
+  tcp_enabled: true
+  tcp_port: 514
+  buffer_size: 8192
+
+# Storage Settings
+storage:
+  # How long to keep logs (Community: max 7 days, Pro: 90, Enterprise: 365)
+  retention_days: 30
+  # How often to run cleanup (hours)
+  cleanup_interval_hours: 6
+  # Max database size in MB (approximate, cleaned up on next cycle)
+  max_db_size_mb: 500
+
+# Dashboard Settings
+dashboard:
+  host: 0.0.0.0
+  port: 8514
+
+# Alert Email Settings
+alerting:
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 587
+    use_tls: true
+    username: ""
+    password: ""
+    from_addr: "sentrylog@yourdomain.com"
+    recipients: []
+
+# Netmon Integration (add-on mode)
+# When enabled, SentryLog can correlate log sources with netmon devices.
+netmon_integration:
+  enabled: false
+  netmon_url: "http://localhost:8080"
