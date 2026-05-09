@@ -7,7 +7,7 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 /* ============================================================
-   MyClover.Tech.SentryLog v1.0 Dashboard
+   MyClover.Tech.SentryLog v2.0 Dashboard
    Dark theme matching netmon aesthetic
    ============================================================ */
 :root {
@@ -506,6 +506,7 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <button class="nav-tab" data-tab="sources">Sources</button>
     <button class="nav-tab" data-tab="rules">Alert Rules</button>
     <button class="nav-tab" data-tab="alerts" id="alertsTab">Alerts <span class="badge" id="alertBadge" style="display:none">0</span></button>
+    <button class="nav-tab" data-tab="winlog">Windows Logs</button>
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
   <div class="nav-right">
@@ -657,6 +658,56 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <div id="alertsList"></div>
   </div>
 
+  <!-- ==================== WINDOWS LOGS TAB (Phase 2) ==================== -->
+  <div class="tab-panel" id="tab-winlog">
+    <div style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
+      <div>
+        <div class="card-title" style="margin:0">Windows Event Log Collectors</div>
+        <div style="font-size:12px; color:var(--text-dim); margin-top:2px">
+          Enterprise feature -- collect from local or remote Windows machines
+        </div>
+      </div>
+      <div style="display:flex; gap:8px">
+        <button class="btn" onclick="loadWinlogTargets()">Refresh</button>
+        <button class="btn btn-primary" onclick="openWinlogModal()">+ Add Target</button>
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div class="card" id="winlogStatusBar" style="display:flex; gap:24px; align-items:center; padding:12px 16px; flex-wrap:wrap">
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Targets:</span>
+        <span id="wlStatTargets" style="font-weight:600">0</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Running:</span>
+        <span id="wlStatRunning" style="font-weight:600; color:var(--accent)">0</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">Total Events:</span>
+        <span id="wlStatEvents" style="font-weight:600">0</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">pywin32:</span>
+        <span id="wlStatPywin32" style="font-weight:600">--</span>
+      </div>
+      <div style="font-size:12px">
+        <span style="color:var(--text-dim)">pywinrm:</span>
+        <span id="wlStatPywinrm" style="font-weight:600">--</span>
+      </div>
+    </div>
+
+    <!-- Target list -->
+    <div id="winlogTargetList">
+      <div class="empty">
+        <div class="empty-icon" style="font-size:36px">&#x1F5A5;</div>
+        <div class="empty-title">No Windows Event Log targets</div>
+        <div class="empty-desc">Add a local or remote Windows machine to start collecting event logs.<br>
+        Requires Enterprise license.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== SETTINGS TAB ==================== -->
   <div class="tab-panel" id="tab-settings">
     <div class="card">
@@ -724,7 +775,7 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     </div>
 
     <div class="card" style="text-align:center; color:var(--text-dim); font-size:12px">
-      MyClover.Tech.SentryLog v1.0.0 | <a href="https://myclover.tech" target="_blank">myclover.tech</a>
+      MyClover.Tech.SentryLog v2.0.0 | <a href="https://myclover.tech" target="_blank">myclover.tech</a>
     </div>
   </div>
 
@@ -825,6 +876,74 @@ tr:hover td { background: rgba(34,197,94,0.03); }
   </div>
 </div>
 
+<!-- Windows Log Target Modal -->
+<div class="modal-overlay" id="winlogModal">
+  <div class="modal" style="max-width:520px">
+    <h3 id="winlogModalTitle">Add Windows Event Log Target</h3>
+    <input type="hidden" id="winlogEditId" value="">
+    <div class="form-group">
+      <label>Target Name</label>
+      <input type="text" id="wlName" placeholder="e.g. Domain Controller, File Server">
+    </div>
+    <div class="form-group">
+      <label>Collection Type</label>
+      <select id="wlType" onchange="toggleWinlogFields()">
+        <option value="local">Local (this machine -- requires pywin32)</option>
+        <option value="remote">Remote (via WinRM -- requires pywinrm)</option>
+      </select>
+    </div>
+    <div id="wlRemoteFields" style="display:none">
+      <div class="form-group">
+        <label>Hostname / IP</label>
+        <input type="text" id="wlHostname" placeholder="e.g. 192.168.1.10 or dc01.corp.local">
+      </div>
+      <div style="display:flex; gap:12px">
+        <div class="form-group" style="flex:1">
+          <label>Username</label>
+          <input type="text" id="wlUsername" placeholder="DOMAIN\\admin or admin@domain">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>Password</label>
+          <input type="password" id="wlPassword" placeholder="password">
+        </div>
+      </div>
+      <div style="display:flex; gap:12px">
+        <div class="form-group" style="flex:1">
+          <label>Port</label>
+          <input type="number" id="wlPort" value="5985">
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>Use SSL (HTTPS)</label>
+          <select id="wlSsl" onchange="updateWinlogPort()">
+            <option value="false">No (port 5985)</option>
+            <option value="true">Yes (port 5986)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Event Log Channels (comma-separated)</label>
+      <input type="text" id="wlChannels" value="Security,System,Application"
+        placeholder="Security,System,Application,Microsoft-Windows-Sysmon/Operational">
+    </div>
+    <div class="form-group">
+      <label>Poll Interval (seconds)</label>
+      <input type="number" id="wlPollInterval" value="60" min="10" max="3600">
+    </div>
+    <div class="form-group">
+      <label>Enabled</label>
+      <select id="wlEnabled">
+        <option value="true">Yes</option>
+        <option value="false">No</option>
+      </select>
+    </div>
+    <div class="form-actions">
+      <button class="btn" onclick="closeWinlogModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveWinlogTarget()">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 /* ============================================================
    SentryLog Dashboard JavaScript
@@ -860,6 +979,7 @@ function switchTab(tab) {
   if (tab === 'sources') loadSources();
   if (tab === 'rules') loadRules();
   if (tab === 'alerts') loadAlerts();
+  if (tab === 'winlog') loadWinlogTab();
   if (tab === 'settings') loadSettings();
 }
 
@@ -1305,6 +1425,194 @@ function ackAlert(id) {
 
 function ackAllAlerts() {
   api('/api/alerts/ack-all', { method: 'POST' }).then(function() { loadAlerts(); loadStats(); });
+}
+
+// ------- Windows Event Logs (Phase 2) -------
+function loadWinlogTab() {
+  loadWinlogStatus();
+  loadWinlogTargets();
+}
+
+function loadWinlogStatus() {
+  api('/api/winlog/status').then(function(d) {
+    document.getElementById('wlStatTargets').textContent = d.total_targets || 0;
+    document.getElementById('wlStatRunning').textContent = d.running_collectors || 0;
+    document.getElementById('wlStatEvents').textContent = formatNum(d.total_winlog_events || 0);
+    var pw32 = document.getElementById('wlStatPywin32');
+    var pwrm = document.getElementById('wlStatPywinrm');
+    if (d.pywin32_available) {
+      pw32.textContent = 'Installed';
+      pw32.style.color = 'var(--accent)';
+    } else {
+      pw32.textContent = 'Not installed';
+      pw32.style.color = 'var(--orange)';
+    }
+    if (d.pywinrm_available) {
+      pwrm.textContent = 'Installed';
+      pwrm.style.color = 'var(--accent)';
+    } else {
+      pwrm.textContent = 'Not installed';
+      pwrm.style.color = 'var(--orange)';
+    }
+  }).catch(function(e) {
+    // Tier restriction -- show upgrade message
+    document.getElementById('winlogTargetList').innerHTML =
+      '<div class="empty"><div class="empty-icon" style="font-size:36px">&#x1F512;</div>' +
+      '<div class="empty-title">Enterprise Feature</div>' +
+      '<div class="empty-desc">Windows Event Log collection requires an Enterprise license.<br>' +
+      '<a href="https://myclover.tech/pricing" target="_blank">View Pricing</a></div></div>';
+  });
+}
+
+function loadWinlogTargets() {
+  api('/api/winlog/targets').then(function(d) {
+    var el = document.getElementById('winlogTargetList');
+    if (!d.targets || d.targets.length === 0) {
+      el.innerHTML =
+        '<div class="empty"><div class="empty-icon" style="font-size:36px">&#x1F5A5;</div>' +
+        '<div class="empty-title">No Windows Event Log targets</div>' +
+        '<div class="empty-desc">Click "+ Add Target" to start collecting Windows Event Logs.</div></div>';
+      return;
+    }
+    var html = '';
+    d.targets.forEach(function(t) {
+      var statusColor = t.collector_running ? 'var(--accent)' : 'var(--gray)';
+      var statusText = t.collector_running ? 'Running' : (t.enabled ? 'Stopped' : 'Disabled');
+      var typeLabel = t.target_type === 'local' ? 'Local (pywin32)' : 'Remote (WinRM)';
+
+      html += '<div class="card" style="margin-bottom:12px; padding:16px">';
+      html += '<div style="display:flex; justify-content:space-between; align-items:start; flex-wrap:wrap; gap:8px">';
+
+      // Left side - info
+      html += '<div style="flex:1; min-width:200px">';
+      html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px">';
+      html += '<span style="width:10px; height:10px; border-radius:50%; background:' + statusColor + '; display:inline-block"></span>';
+      html += '<span style="font-weight:600; font-size:15px">' + esc(t.name) + '</span>';
+      html += '<span class="sev-badge sev-info" style="font-size:10px">' + esc(typeLabel) + '</span>';
+      html += '</div>';
+
+      html += '<div style="font-size:12px; color:var(--text-dim); display:flex; flex-wrap:wrap; gap:12px">';
+      if (t.target_type === 'remote') {
+        html += '<span>Host: <span style="color:var(--text); font-family:Consolas,monospace">' + esc(t.hostname) + ':' + t.port + '</span></span>';
+      }
+      html += '<span>Channels: <span style="color:var(--text)">' + esc(t.channels) + '</span></span>';
+      html += '<span>Poll: <span style="color:var(--text)">' + t.poll_interval_seconds + 's</span></span>';
+      html += '<span>Events: <span style="color:var(--text); font-weight:600">' + formatNum(t.log_count) + '</span></span>';
+      html += '</div>';
+
+      if (t.last_poll) {
+        html += '<div style="font-size:11px; color:var(--text-dim); margin-top:4px">Last poll: ' + esc(t.last_poll) + '</div>';
+      }
+      if (t.error_message) {
+        html += '<div style="font-size:11px; color:var(--red); margin-top:4px">Error: ' + esc(t.error_message) + '</div>';
+      }
+      html += '</div>';
+
+      // Right side - actions
+      html += '<div style="display:flex; gap:6px; align-items:start">';
+      html += '<span style="font-size:11px; color:' + statusColor + '; font-weight:600; padding:4px 0">' + statusText + '</span>';
+      html += '<button class="btn btn-sm" onclick="testWinlogTarget(' + t.id + ')">Test</button>';
+      html += '<button class="btn btn-sm" onclick="editWinlogTarget(' + t.id + ')">Edit</button>';
+      html += '<button class="btn btn-sm btn-danger" onclick="deleteWinlogTarget(' + t.id + ')">Delete</button>';
+      html += '</div>';
+
+      html += '</div>';
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(function() {
+    // Handled in loadWinlogStatus
+  });
+}
+
+function openWinlogModal(target) {
+  document.getElementById('winlogEditId').value = target ? target.id : '';
+  document.getElementById('winlogModalTitle').textContent = target ? 'Edit Windows Log Target' : 'Add Windows Event Log Target';
+  document.getElementById('wlName').value = target ? target.name : '';
+  document.getElementById('wlType').value = target ? target.target_type : 'local';
+  document.getElementById('wlHostname').value = target ? (target.hostname || '') : '';
+  document.getElementById('wlUsername').value = target ? (target.username || '') : '';
+  document.getElementById('wlPassword').value = target ? (target.password || '') : '';
+  document.getElementById('wlPort').value = target ? target.port : 5985;
+  document.getElementById('wlSsl').value = target ? (target.use_ssl ? 'true' : 'false') : 'false';
+  document.getElementById('wlChannels').value = target ? target.channels : 'Security,System,Application';
+  document.getElementById('wlPollInterval').value = target ? target.poll_interval_seconds : 60;
+  document.getElementById('wlEnabled').value = target ? (target.enabled ? 'true' : 'false') : 'true';
+  toggleWinlogFields();
+  document.getElementById('winlogModal').classList.add('active');
+}
+
+function closeWinlogModal() {
+  document.getElementById('winlogModal').classList.remove('active');
+}
+
+function toggleWinlogFields() {
+  var type = document.getElementById('wlType').value;
+  document.getElementById('wlRemoteFields').style.display = type === 'remote' ? 'block' : 'none';
+}
+
+function updateWinlogPort() {
+  var ssl = document.getElementById('wlSsl').value === 'true';
+  document.getElementById('wlPort').value = ssl ? 5986 : 5985;
+}
+
+function saveWinlogTarget() {
+  var id = document.getElementById('winlogEditId').value;
+  var data = {
+    name: document.getElementById('wlName').value,
+    target_type: document.getElementById('wlType').value,
+    hostname: document.getElementById('wlHostname').value || 'localhost',
+    username: document.getElementById('wlUsername').value,
+    password: document.getElementById('wlPassword').value,
+    use_ssl: document.getElementById('wlSsl').value === 'true',
+    port: parseInt(document.getElementById('wlPort').value) || 5985,
+    channels: document.getElementById('wlChannels').value,
+    poll_interval_seconds: parseInt(document.getElementById('wlPollInterval').value) || 60,
+    enabled: document.getElementById('wlEnabled').value === 'true',
+  };
+
+  if (!data.name) {
+    alert('Please enter a target name.');
+    return;
+  }
+
+  var url = id ? '/api/winlog/targets/' + id : '/api/winlog/targets';
+  var method = id ? 'PUT' : 'POST';
+
+  api(url, { method: method, body: data }).then(function(r) {
+    if (r.error) {
+      alert(r.message || 'Error saving target. Enterprise license may be required.');
+      return;
+    }
+    closeWinlogModal();
+    loadWinlogTab();
+  });
+}
+
+function editWinlogTarget(targetId) {
+  api('/api/winlog/targets').then(function(d) {
+    var target = (d.targets || []).find(function(t) { return t.id === targetId; });
+    if (target) openWinlogModal(target);
+  });
+}
+
+function deleteWinlogTarget(targetId) {
+  if (!confirm('Delete this Windows Event Log target? Collection will stop.')) return;
+  api('/api/winlog/targets/' + targetId, { method: 'DELETE' }).then(function() {
+    loadWinlogTab();
+  });
+}
+
+function testWinlogTarget(targetId) {
+  api('/api/winlog/targets/' + targetId + '/test', { method: 'POST' }).then(function(r) {
+    if (r.status === 'ok') {
+      alert('Connection successful!\n\n' + (r.message || ''));
+    } else {
+      alert('Connection failed:\n\n' + (r.message || 'Unknown error'));
+    }
+  }).catch(function() {
+    alert('Test failed. Enterprise license may be required.');
+  });
 }
 
 // ------- Settings -------

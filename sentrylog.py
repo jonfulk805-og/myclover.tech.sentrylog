@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-MyClover.Tech.SentryLog v1.0 - Log Aggregation & Security Alert Platform
+MyClover.Tech.SentryLog v2.0 - Log Aggregation & Security Alert Platform
 
 A standalone log aggregation and SIEM-lite product from the MyClover.Tech suite.
-Collects syslog from any device, parses and stores logs, fires alerts on pattern
-matches, and provides a searchable dashboard.
+Collects syslog from any device, reads Windows Event Logs locally or remotely,
+parses and stores logs, fires alerts on pattern matches, and provides a
+searchable dashboard.
 
 Can run standalone or as an add-on to MyClover.Tech.netmon.
 
 Features:
+  Phase 1:
   - Syslog receiver (UDP + TCP, RFC 3164 / RFC 5424)
   - Auto-discovery of log sources
   - SQLite storage with configurable retention
@@ -18,6 +20,15 @@ Features:
   - REST API for all operations
   - Dark-themed web dashboard
   - Netmon add-on integration
+
+  Phase 2 (NEW):
+  - Windows Event Log collector (local via pywin32)
+  - Windows Event Log collector (remote via WinRM / pywinrm)
+  - Collects from Security, System, Application, and custom channels
+  - Event severity mapping (Windows EventType -> syslog severity)
+  - Bookmark tracking to avoid duplicate collection
+  - Configurable poll intervals per target
+  - Enterprise tier feature
 """
 
 import os
@@ -55,10 +66,29 @@ except ImportError:
     HAS_FLASK = False
     print("[WARN] Flask not installed. Dashboard disabled. Run: pip install flask")
 
+# Phase 2: Windows Event Log support
+HAS_WIN32 = False
+HAS_WINRM = False
+
+try:
+    import win32evtlog
+    import win32evtlogutil
+    import win32con
+    import win32security
+    HAS_WIN32 = True
+except ImportError:
+    pass  # pywin32 not installed -- local Windows Event Log disabled
+
+try:
+    import winrm
+    HAS_WINRM = True
+except ImportError:
+    pass  # pywinrm not installed -- remote Windows Event Log disabled
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "sentrylog.db"
 DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
@@ -123,20 +153,20 @@ def validate_license_key(key):
     """Validate a license key and return the tier, or None if invalid."""
     if not key or not isinstance(key, str):
         return None
-    parts = key.strip().split("-")
+    parts = key.strip().upper().split("-")
     if len(parts) != 3:
         return None
-    tier_code, uid, sig = parts
+    tier_code, unique_id, provided_sig = parts
     tier_map = {"PRO": TIER_PRO, "ENT": TIER_ENT}
     if tier_code not in tier_map:
         return None
-    payload = "%s-%s" % (tier_code, uid)
-    expected = hashlib.sha256(
+    payload = "%s-%s" % (tier_code, unique_id)
+    expected_sig = hashlib.sha256(
         _LICENSE_SECRET + payload.encode("utf-8")
     ).hexdigest()[:16].upper()
-    if sig.upper() == expected:
-        return tier_map[tier_code]
-    return None
+    if provided_sig != expected_sig:
+        return None
+    return tier_map[tier_code]
 
 
 def get_tier():
@@ -395,6 +425,29 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_alerts_timestamp
         ON alerts(timestamp DESC)
+    """)
+
+    # Phase 2: Windows Event Log targets
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS winlog_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT 'local',
+            hostname TEXT DEFAULT 'localhost',
+            username TEXT DEFAULT '',
+            password TEXT DEFAULT '',
+            use_ssl INTEGER DEFAULT 0,
+            port INTEGER DEFAULT 5985,
+            channels TEXT DEFAULT 'Security,System,Application',
+            poll_interval_seconds INTEGER DEFAULT 60,
+            enabled INTEGER DEFAULT 1,
+            last_poll TEXT DEFAULT '',
+            last_bookmark TEXT DEFAULT '',
+            log_count INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
     """)
 
     conn.commit()
@@ -847,6 +900,520 @@ def cleanup_loop():
 
 
 # ---------------------------------------------------------------------------
+# Phase 2: Windows Event Log Collector
+# ---------------------------------------------------------------------------
+# Maps Windows event types to syslog severity
+WIN_EVENT_TYPE_MAP = {
+    "Error": "error",
+    "Warning": "warning",
+    "Information": "info",
+    "Audit Success": "info",
+    "Audit Failure": "warning",
+    "Critical": "critical",
+}
+
+# Numeric EventType constants (win32evtlog / EVENTLOGRECORD)
+WIN_EVENT_CODE_MAP = {
+    1: "error",         # EVENTLOG_ERROR_TYPE
+    2: "warning",       # EVENTLOG_WARNING_TYPE
+    4: "info",          # EVENTLOG_INFORMATION_TYPE
+    8: "info",          # EVENTLOG_AUDIT_SUCCESS
+    16: "warning",      # EVENTLOG_AUDIT_FAILURE
+}
+
+SEVERITY_CODE_MAP = {
+    "emergency": 0, "alert": 1, "critical": 2, "error": 3,
+    "warning": 4, "notice": 5, "info": 6, "debug": 7,
+}
+
+# Active collector threads (target_id -> thread)
+_winlog_threads = {}
+_winlog_threads_lock = threading.Lock()
+
+
+def _winlog_event_to_log(event_dict, source_ip, source_name):
+    """Convert a Windows Event Log dict into the standard log format."""
+    severity = event_dict.get("severity", "info")
+    sev_code = SEVERITY_CODE_MAP.get(severity, 6)
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ts = event_dict.get("timestamp", now)
+    return {
+        "timestamp": ts,
+        "received_at": now,
+        "source_ip": source_ip,
+        "source_name": source_name,
+        "facility": "winlog:" + event_dict.get("channel", "System"),
+        "facility_code": -2,  # -2 = Windows Event Log marker
+        "severity": severity,
+        "severity_code": sev_code,
+        "app_name": event_dict.get("source", ""),
+        "process_id": str(event_dict.get("event_id", "")),
+        "message": event_dict.get("message", ""),
+        "raw": event_dict.get("raw", ""),
+    }
+
+
+def _update_winlog_target(target_id, **kwargs):
+    """Update a winlog target in the database."""
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    sets = []
+    params = []
+    for k, v in kwargs.items():
+        sets.append("%s = ?" % k)
+        params.append(v)
+    sets.append("updated_at = ?")
+    params.append(now)
+    params.append(target_id)
+    conn.execute(
+        "UPDATE winlog_targets SET %s WHERE id = ?" % ", ".join(sets),
+        params
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---- Local Windows Event Log (pywin32) ----
+def _collect_local_winlog(target_id, channels, poll_interval):
+    """Collect Windows Event Logs from the local machine using pywin32."""
+    if not HAS_WIN32:
+        _update_winlog_target(
+            target_id, enabled=0,
+            error_message="pywin32 not installed. Run: pip install pywin32"
+        )
+        log.error("[WinLog] pywin32 not installed -- disabling target %d", target_id)
+        return
+
+    log.info("[WinLog] Local collector started for target %d, channels: %s",
+             target_id, channels)
+
+    # Load bookmarks (record number per channel)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_bookmark FROM winlog_targets WHERE id = ?", (target_id,)
+    ).fetchone()
+    conn.close()
+
+    bookmarks = {}
+    if row and row["last_bookmark"]:
+        try:
+            bookmarks = json_mod.loads(row["last_bookmark"])
+        except Exception:
+            bookmarks = {}
+
+    while _running:
+        # Check if target is still enabled
+        conn = get_db()
+        row = conn.execute(
+            "SELECT enabled FROM winlog_targets WHERE id = ?", (target_id,)
+        ).fetchone()
+        conn.close()
+        if not row or not row["enabled"]:
+            log.info("[WinLog] Target %d disabled -- stopping collector", target_id)
+            break
+
+        total_new = 0
+
+        for channel in channels:
+            channel = channel.strip()
+            if not channel:
+                continue
+
+            try:
+                hand = win32evtlog.OpenEventLog(None, channel)
+                flags = (win32evtlog.EVENTLOG_FORWARDS_READ |
+                         win32evtlog.EVENTLOG_SEQUENTIAL_READ)
+
+                # Get total records to know where we are
+                total = win32evtlog.GetNumberOfEventLogRecords(hand)
+                oldest = win32evtlog.GetOldestEventLogRecord(hand)
+
+                last_record = bookmarks.get(channel, 0)
+
+                while True:
+                    events = win32evtlog.ReadEventLog(hand, flags, 0)
+                    if not events:
+                        break
+
+                    for event in events:
+                        rec_num = event.RecordNumber
+                        if rec_num <= last_record:
+                            continue
+
+                        # Extract event data
+                        evt_type_code = event.EventType or 4
+                        severity = WIN_EVENT_CODE_MAP.get(evt_type_code, "info")
+                        source_name_ev = event.SourceName or ""
+                        event_id = event.EventID & 0xFFFF  # Mask to 16-bit
+                        ts = event.TimeGenerated
+                        if hasattr(ts, "strftime"):
+                            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            ts_str = str(ts)
+
+                        # Build message from strings data
+                        msg_parts = []
+                        if event.StringInserts:
+                            msg_parts = list(event.StringInserts)
+
+                        # Try to format the message with FormatMessage
+                        try:
+                            full_msg = win32evtlogutil.SafeFormatMessage(
+                                event, channel
+                            )
+                        except Exception:
+                            full_msg = " | ".join(msg_parts) if msg_parts else (
+                                "EventID %d from %s" % (event_id, source_name_ev)
+                            )
+
+                        raw_info = "Channel=%s EventID=%d RecordNumber=%d Type=%d Source=%s" % (
+                            channel, event_id, rec_num, evt_type_code, source_name_ev
+                        )
+
+                        event_dict = {
+                            "timestamp": ts_str,
+                            "channel": channel,
+                            "source": source_name_ev,
+                            "event_id": event_id,
+                            "severity": severity,
+                            "message": full_msg,
+                            "raw": raw_info,
+                        }
+
+                        entry = _winlog_event_to_log(
+                            event_dict, "127.0.0.1", "localhost"
+                        )
+                        ingest_log(entry)
+                        total_new += 1
+                        bookmarks[channel] = rec_num
+
+                win32evtlog.CloseEventLog(hand)
+
+            except Exception as e:
+                err_msg = "Error reading %s: %s" % (channel, str(e))
+                log.error("[WinLog] %s", err_msg)
+                _update_winlog_target(target_id, error_message=err_msg)
+
+        # Save bookmarks and update count
+        if total_new > 0:
+            with _log_buffer_lock:
+                _flush_logs()
+
+        bm_json = json_mod.dumps(bookmarks)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _update_winlog_target(
+            target_id,
+            last_poll=now,
+            last_bookmark=bm_json,
+            error_message=""
+        )
+        if total_new > 0:
+            conn = get_db()
+            conn.execute(
+                "UPDATE winlog_targets SET log_count = log_count + ? WHERE id = ?",
+                (total_new, target_id)
+            )
+            conn.commit()
+            conn.close()
+            log.info("[WinLog] Local: collected %d new events", total_new)
+
+        # Sleep for poll interval
+        for _ in range(poll_interval):
+            if not _running:
+                return
+            time.sleep(1)
+
+    log.info("[WinLog] Local collector stopped for target %d", target_id)
+
+
+# ---- Remote Windows Event Log (WinRM / pywinrm) ----
+# PowerShell script to read events from a remote Windows machine
+_WINRM_PS_TEMPLATE = r"""
+$channels = @(%s)
+$since = '%s'
+$maxPerChannel = 500
+$results = @()
+foreach ($ch in $channels) {
+    try {
+        $filter = @{LogName=$ch}
+        if ($since -ne '') {
+            $filter['StartTime'] = [DateTime]::Parse($since)
+        }
+        $evts = Get-WinEvent -FilterHashtable $filter -MaxEvents $maxPerChannel -ErrorAction SilentlyContinue
+        foreach ($e in $evts) {
+            $obj = [PSCustomObject]@{
+                Channel   = $ch
+                TimeCreated = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                Id        = $e.Id
+                Level     = $e.LevelDisplayName
+                LevelVal  = $e.Level
+                Source    = $e.ProviderName
+                Message   = if ($e.Message) { $e.Message.Substring(0, [Math]::Min($e.Message.Length, 1000)) } else { '' }
+                RecordId  = $e.RecordId
+            }
+            $results += $obj
+        }
+    } catch { }
+}
+$results | ConvertTo-Json -Depth 3 -Compress
+"""
+
+# WinRM event level to severity
+_WINRM_LEVEL_MAP = {
+    1: "critical",     # Critical
+    2: "error",        # Error
+    3: "warning",      # Warning
+    4: "info",         # Information
+    5: "debug",        # Verbose
+    0: "info",         # LogAlways
+}
+
+
+def _collect_remote_winlog(target_id, hostname, username, password,
+                           use_ssl, port, channels, poll_interval):
+    """Collect Windows Event Logs from a remote machine via WinRM."""
+    if not HAS_WINRM:
+        _update_winlog_target(
+            target_id, enabled=0,
+            error_message="pywinrm not installed. Run: pip install pywinrm"
+        )
+        log.error("[WinRM] pywinrm not installed -- disabling target %d", target_id)
+        return
+
+    transport = "ssl" if use_ssl else "ntlm"
+    scheme = "https" if use_ssl else "http"
+    endpoint = "%s://%s:%d/wsman" % (scheme, hostname, port)
+
+    log.info("[WinRM] Remote collector started for %s (target %d), channels: %s",
+             hostname, target_id, channels)
+
+    # Load bookmark (last poll timestamp per channel)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT last_bookmark FROM winlog_targets WHERE id = ?", (target_id,)
+    ).fetchone()
+    conn.close()
+
+    bookmarks = {}
+    if row and row["last_bookmark"]:
+        try:
+            bookmarks = json_mod.loads(row["last_bookmark"])
+        except Exception:
+            bookmarks = {}
+
+    while _running:
+        # Check if target is still enabled
+        conn = get_db()
+        row = conn.execute(
+            "SELECT enabled FROM winlog_targets WHERE id = ?", (target_id,)
+        ).fetchone()
+        conn.close()
+        if not row or not row["enabled"]:
+            log.info("[WinRM] Target %d disabled -- stopping", target_id)
+            break
+
+        total_new = 0
+        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            session = winrm.Session(
+                endpoint,
+                auth=(username, password),
+                transport=transport,
+                server_cert_validation="ignore",
+            )
+
+            # Build PowerShell channel list
+            ch_list = ",".join(["'%s'" % c.strip() for c in channels if c.strip()])
+            # Use the latest bookmark as the since parameter
+            since_times = [bookmarks.get(c.strip(), "") for c in channels if c.strip()]
+            since_val = ""
+            if any(since_times):
+                # Use the oldest non-empty bookmark
+                valid = [t for t in since_times if t]
+                if valid:
+                    since_val = min(valid)
+
+            ps_script = _WINRM_PS_TEMPLATE % (ch_list, since_val)
+
+            result = session.run_ps(ps_script)
+
+            if result.status_code != 0:
+                err = result.std_err
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", errors="replace")
+                _update_winlog_target(
+                    target_id,
+                    error_message="WinRM error: %s" % str(err)[:200],
+                    last_poll=now_str,
+                )
+                log.error("[WinRM] Error from %s: %s", hostname, str(err)[:200])
+            else:
+                output = result.std_out
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                output = output.strip()
+
+                events = []
+                if output:
+                    try:
+                        parsed = json_mod.loads(output)
+                        if isinstance(parsed, dict):
+                            events = [parsed]
+                        elif isinstance(parsed, list):
+                            events = parsed
+                    except json_mod.JSONDecodeError:
+                        log.warning("[WinRM] Could not parse JSON from %s", hostname)
+
+                for evt in events:
+                    channel_name = evt.get("Channel", "Unknown")
+                    record_id = evt.get("RecordId", 0)
+
+                    # Skip if we already have this record
+                    bm_key = channel_name
+                    last_ts = bookmarks.get(bm_key, "")
+                    evt_ts = evt.get("TimeCreated", "")
+                    if last_ts and evt_ts <= last_ts:
+                        continue
+
+                    level_val = evt.get("LevelVal", 4)
+                    severity = _WINRM_LEVEL_MAP.get(level_val, "info")
+                    level_name = evt.get("Level", "Information")
+                    if not severity and level_name:
+                        severity = WIN_EVENT_TYPE_MAP.get(level_name, "info")
+
+                    event_dict = {
+                        "timestamp": evt_ts,
+                        "channel": channel_name,
+                        "source": evt.get("Source", ""),
+                        "event_id": evt.get("Id", 0),
+                        "severity": severity,
+                        "message": evt.get("Message", ""),
+                        "raw": "Channel=%s EventID=%s RecordId=%s Level=%s Source=%s" % (
+                            channel_name, evt.get("Id", ""),
+                            record_id, level_name, evt.get("Source", "")
+                        ),
+                    }
+
+                    entry = _winlog_event_to_log(
+                        event_dict, hostname, hostname
+                    )
+                    ingest_log(entry)
+                    total_new += 1
+
+                    # Update bookmark to latest timestamp per channel
+                    if evt_ts > bookmarks.get(bm_key, ""):
+                        bookmarks[bm_key] = evt_ts
+
+                _update_winlog_target(
+                    target_id,
+                    last_poll=now_str,
+                    last_bookmark=json_mod.dumps(bookmarks),
+                    error_message=""
+                )
+
+                if total_new > 0:
+                    with _log_buffer_lock:
+                        _flush_logs()
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE winlog_targets SET log_count = log_count + ? WHERE id = ?",
+                        (total_new, target_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                    log.info("[WinRM] %s: collected %d new events", hostname, total_new)
+
+        except Exception as e:
+            err_msg = "Connection error: %s" % str(e)[:200]
+            log.error("[WinRM] %s: %s", hostname, err_msg)
+            _update_winlog_target(
+                target_id, error_message=err_msg, last_poll=now_str
+            )
+
+        # Sleep for poll interval
+        for _ in range(poll_interval):
+            if not _running:
+                return
+            time.sleep(1)
+
+    log.info("[WinRM] Remote collector stopped for %s (target %d)", hostname, target_id)
+
+
+def start_winlog_collector(target):
+    """Start a collector thread for a Windows Event Log target."""
+    target_id = target["id"]
+
+    with _winlog_threads_lock:
+        if target_id in _winlog_threads:
+            old_t = _winlog_threads[target_id]
+            if old_t.is_alive():
+                return  # Already running
+
+    channels_str = target.get("channels", "Security,System,Application")
+    channels = [c.strip() for c in channels_str.split(",") if c.strip()]
+    poll_interval = target.get("poll_interval_seconds", 60)
+
+    if target["target_type"] == "local":
+        t = threading.Thread(
+            target=_collect_local_winlog,
+            args=(target_id, channels, poll_interval),
+            daemon=True,
+        )
+    elif target["target_type"] == "remote":
+        t = threading.Thread(
+            target=_collect_remote_winlog,
+            args=(
+                target_id,
+                target.get("hostname", ""),
+                target.get("username", ""),
+                target.get("password", ""),
+                bool(target.get("use_ssl", 0)),
+                target.get("port", 5985),
+                channels,
+                poll_interval,
+            ),
+            daemon=True,
+        )
+    else:
+        log.error("[WinLog] Unknown target type: %s", target["target_type"])
+        return
+
+    t.start()
+    with _winlog_threads_lock:
+        _winlog_threads[target_id] = t
+    log.info("[WinLog] Started collector for target %d (%s)",
+             target_id, target["target_type"])
+
+
+def stop_winlog_collector(target_id):
+    """Stop a collector by disabling the target (thread checks on next poll)."""
+    _update_winlog_target(target_id, enabled=0)
+    log.info("[WinLog] Requested stop for target %d", target_id)
+
+
+def _start_all_winlog_collectors():
+    """Start collectors for all enabled winlog targets."""
+    features = get_tier_features()
+    if not features.get("windows_eventlog", False):
+        log.info("[WinLog] Windows Event Log feature not enabled for current tier")
+        return
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM winlog_targets WHERE enabled = 1"
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        target = dict(row)
+        start_winlog_collector(target)
+
+    if rows:
+        log.info("[WinLog] Started %d collector(s)", len(rows))
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 def get_stats(hours=24):
@@ -1265,6 +1832,235 @@ if HAS_FLASK:
         save_config(_config)
         return jsonify({"status": "ok"})
 
+    # ---- Windows Event Log Targets (Phase 2) ----
+    @app.route("/api/winlog/targets")
+    @require_tier(TIER_ENT)
+    def api_winlog_targets():
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT * FROM winlog_targets ORDER BY created_at DESC"
+        ).fetchall()
+        conn.close()
+        targets = []
+        for r in rows:
+            d = dict(r)
+            # Mask password in response
+            if d.get("password"):
+                d["password"] = "********"
+            # Check if collector thread is alive
+            with _winlog_threads_lock:
+                t = _winlog_threads.get(d["id"])
+                d["collector_running"] = t is not None and t.is_alive()
+            targets.append(d)
+        return jsonify({"targets": targets})
+
+    @app.route("/api/winlog/targets", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_create_winlog_target():
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        target_type = data.get("target_type", "local")
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO winlog_targets (name, target_type, hostname, username,
+                password, use_ssl, port, channels, poll_interval_seconds,
+                enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("name", "Windows Logs"),
+            target_type,
+            data.get("hostname", "localhost"),
+            data.get("username", ""),
+            data.get("password", ""),
+            1 if data.get("use_ssl", False) else 0,
+            data.get("port", 5985 if not data.get("use_ssl") else 5986),
+            data.get("channels", "Security,System,Application"),
+            data.get("poll_interval_seconds", 60),
+            1 if data.get("enabled", True) else 0,
+            now, now,
+        ))
+        target_id = c.lastrowid
+        conn.commit()
+
+        # Also add as a source
+        conn.execute("""
+            INSERT OR IGNORE INTO sources (ip, name, first_seen, last_seen,
+                log_count, device_type, os_type)
+            VALUES (?, ?, ?, ?, 0, 'Windows', 'Windows')
+        """, (
+            data.get("hostname", "localhost"),
+            data.get("name", "Windows Logs"),
+            now, now,
+        ))
+        conn.commit()
+        conn.close()
+
+        # Start collector if enabled
+        if data.get("enabled", True):
+            row = get_db().execute(
+                "SELECT * FROM winlog_targets WHERE id = ?", (target_id,)
+            ).fetchone()
+            if row:
+                start_winlog_collector(dict(row))
+
+        return jsonify({"status": "ok", "id": target_id})
+
+    @app.route("/api/winlog/targets/<int:target_id>", methods=["PUT"])
+    @require_tier(TIER_ENT)
+    def api_update_winlog_target(target_id):
+        data = request.get_json(force=True)
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_db()
+        # If password is masked, keep the old one
+        old_row = conn.execute(
+            "SELECT password FROM winlog_targets WHERE id = ?", (target_id,)
+        ).fetchone()
+        password = data.get("password", "")
+        if password == "********" and old_row:
+            password = old_row["password"]
+
+        conn.execute("""
+            UPDATE winlog_targets SET name = ?, target_type = ?, hostname = ?,
+                username = ?, password = ?, use_ssl = ?, port = ?,
+                channels = ?, poll_interval_seconds = ?, enabled = ?,
+                updated_at = ?
+            WHERE id = ?
+        """, (
+            data.get("name", ""),
+            data.get("target_type", "local"),
+            data.get("hostname", "localhost"),
+            data.get("username", ""),
+            password,
+            1 if data.get("use_ssl", False) else 0,
+            data.get("port", 5985),
+            data.get("channels", "Security,System,Application"),
+            data.get("poll_interval_seconds", 60),
+            1 if data.get("enabled", True) else 0,
+            now, target_id,
+        ))
+        conn.commit()
+        conn.close()
+
+        # Restart collector
+        was_enabled = data.get("enabled", True)
+        if was_enabled:
+            row = get_db().execute(
+                "SELECT * FROM winlog_targets WHERE id = ?", (target_id,)
+            ).fetchone()
+            if row:
+                start_winlog_collector(dict(row))
+
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/winlog/targets/<int:target_id>", methods=["DELETE"])
+    @require_tier(TIER_ENT)
+    def api_delete_winlog_target(target_id):
+        stop_winlog_collector(target_id)
+        conn = get_db()
+        conn.execute("DELETE FROM winlog_targets WHERE id = ?", (target_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/winlog/targets/<int:target_id>/test", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_test_winlog_target(target_id):
+        """Test connectivity to a Windows Event Log target."""
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM winlog_targets WHERE id = ?", (target_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "not_found"}), 404
+
+        target = dict(row)
+        result = {"target_id": target_id, "status": "unknown"}
+
+        if target["target_type"] == "local":
+            if not HAS_WIN32:
+                result["status"] = "error"
+                result["message"] = "pywin32 not installed. Run: pip install pywin32"
+            else:
+                try:
+                    channels = [c.strip() for c in target["channels"].split(",") if c.strip()]
+                    test_ch = channels[0] if channels else "System"
+                    hand = win32evtlog.OpenEventLog(None, test_ch)
+                    total = win32evtlog.GetNumberOfEventLogRecords(hand)
+                    win32evtlog.CloseEventLog(hand)
+                    result["status"] = "ok"
+                    result["message"] = "Connected. %s has %d records." % (test_ch, total)
+                except Exception as e:
+                    result["status"] = "error"
+                    result["message"] = str(e)
+
+        elif target["target_type"] == "remote":
+            if not HAS_WINRM:
+                result["status"] = "error"
+                result["message"] = "pywinrm not installed. Run: pip install pywinrm"
+            else:
+                try:
+                    scheme = "https" if target["use_ssl"] else "http"
+                    endpoint = "%s://%s:%d/wsman" % (
+                        scheme, target["hostname"], target["port"]
+                    )
+                    transport = "ssl" if target["use_ssl"] else "ntlm"
+                    session = winrm.Session(
+                        endpoint,
+                        auth=(target["username"], target["password"]),
+                        transport=transport,
+                        server_cert_validation="ignore",
+                    )
+                    r = session.run_ps("Get-WinEvent -ListLog System | Select-Object RecordCount | ConvertTo-Json")
+                    if r.status_code == 0:
+                        output = r.std_out
+                        if isinstance(output, bytes):
+                            output = output.decode("utf-8", errors="replace")
+                        result["status"] = "ok"
+                        result["message"] = "Connected to %s. Response: %s" % (
+                            target["hostname"], output.strip()[:200]
+                        )
+                    else:
+                        err = r.std_err
+                        if isinstance(err, bytes):
+                            err = err.decode("utf-8", errors="replace")
+                        result["status"] = "error"
+                        result["message"] = str(err)[:200]
+                except Exception as e:
+                    result["status"] = "error"
+                    result["message"] = str(e)[:200]
+
+        return jsonify(result)
+
+    @app.route("/api/winlog/status")
+    @require_tier(TIER_ENT)
+    def api_winlog_status():
+        """Get overall Windows Event Log collection status."""
+        conn = get_db()
+        targets = conn.execute("SELECT * FROM winlog_targets").fetchall()
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM logs WHERE facility_code = -2"
+        ).fetchone()[0]
+        conn.close()
+
+        running = 0
+        with _winlog_threads_lock:
+            for tid, t in _winlog_threads.items():
+                if t.is_alive():
+                    running += 1
+
+        return jsonify({
+            "total_targets": len(targets),
+            "enabled_targets": sum(1 for t in targets if t["enabled"]),
+            "running_collectors": running,
+            "total_winlog_events": total_count,
+            "pywin32_available": HAS_WIN32,
+            "pywinrm_available": HAS_WINRM,
+        })
+
     # ---- Test / Utility ----
     @app.route("/api/test-log", methods=["POST"])
     def api_test_log():
@@ -1310,6 +2106,17 @@ def main():
     print("  MyClover.Tech.SentryLog v%s" % VERSION)
     print("  Log Aggregation & Security Alert Platform")
     print("=" * 60)
+    print()
+    if HAS_WIN32:
+        print("  [OK] pywin32 detected -- local Windows Event Log enabled")
+    else:
+        print("  [--] pywin32 not found -- local Windows Event Log disabled")
+        print("       Install: pip install pywin32")
+    if HAS_WINRM:
+        print("  [OK] pywinrm detected -- remote Windows Event Log enabled")
+    else:
+        print("  [--] pywinrm not found -- remote Windows Event Log disabled")
+        print("       Install: pip install pywinrm")
     print()
 
     # Load config
@@ -1358,6 +2165,9 @@ def main():
     t = threading.Thread(target=cleanup_loop, daemon=True)
     t.start()
     threads.append(t)
+
+    # Start Windows Event Log collectors (Phase 2)
+    _start_all_winlog_collectors()
 
     # Start dashboard
     if HAS_FLASK:

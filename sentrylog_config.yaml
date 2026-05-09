@@ -1,5 +1,5 @@
 # ============================================================
-# MyClover.Tech.SentryLog v1.0 - Configuration
+# MyClover.Tech.SentryLog v2.0 - Configuration
 # ============================================================
 # Log Aggregation & Security Alert Platform
 # Part of the MyClover.Tech suite
@@ -43,6 +43,16 @@ alerting:
     password: ""
     from_addr: "sentrylog@yourdomain.com"
     recipients: []
+
+# Windows Event Log Settings (Phase 2 - Enterprise tier)
+# Configure targets in the dashboard UI or via API.
+# Local collection requires pywin32: pip install pywin32
+# Remote collection requires pywinrm: pip install pywinrm
+windows_eventlog:
+  # Default channels to collect from new targets
+  default_channels: "Security,System,Application"
+  # Default poll interval in seconds
+  default_poll_interval: 60
 
 # Netmon Integration (add-on mode)
 # When enabled, SentryLog can correlate log sources with netmon devices.

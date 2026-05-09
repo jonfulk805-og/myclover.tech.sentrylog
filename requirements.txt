@@ -1,2 +1,10 @@
+# MyClover.Tech.SentryLog v2.0 - Requirements
+# Core dependencies (required)
 flask>=3.0.0
 pyyaml>=6.0
+
+# Phase 2: Windows Event Log (optional -- install as needed)
+# Local Windows Event Log collection (Windows only):
+#   pip install pywin32
+# Remote Windows Event Log collection (any OS):
+#   pip install pywinrm
