@@ -45,6 +45,7 @@ Part of the [MyClover.Tech](https://myclover.tech) suite. Can run standalone or 
 
 - Python 3.10+
 - Flask, PyYAML
+- Ubuntu 22.04+ / Windows 10+ / macOS
 
 ### Install
 
@@ -65,6 +66,22 @@ Dashboard opens at **http://localhost:8514**
 Edit `sentrylog_config.yaml` to set syslog ports, retention, and integration options.
 
 > **Note:** Port 514 (standard syslog) requires elevated privileges. Use ports above 1024 or run as Administrator/root.
+
+### Ubuntu LTS Server (Full Guide)
+
+See **[SETUP_UBUNTU.md](SETUP_UBUNTU.md)** for the complete step-by-step deployment guide:
+
+- Base server setup from scratch
+- Python virtual environment & dependencies
+- systemd service (auto-start on boot with port 514 binding)
+- Firewall configuration
+- Nginx reverse proxy with free SSL
+- Connecting log sources (network devices, Linux, Windows, pfSense, UniFi)
+- NetMon integration setup
+- Windows Event Log collection (Enterprise)
+- Security API connectors (Enterprise)
+- Automated backups
+- **Combined NetMon + SentryLog deployment** on one server
 
 ---
 
