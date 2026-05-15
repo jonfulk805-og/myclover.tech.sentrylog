@@ -1,0 +1,40 @@
+# ============================================================
+# MyClover.Tech SentryLog — Standalone Docker Compose
+# ============================================================
+# Usage:
+#   docker compose up -d          # start
+#   docker compose logs -f        # tail logs
+#   docker compose down            # stop
+#
+# Data persists in the 'sentrylog-data' volume (DB + config).
+# To use your own config: mount it at /app/data/sentrylog_config.yaml
+#
+# NOTE: Syslog port 514 requires root or NET_BIND_SERVICE.
+#       To run rootless, remap to a high port:
+#         ports: ["1514:514/udp", "1514:514/tcp"]
+# ============================================================
+
+services:
+  sentrylog:
+    build: .
+    image: myclover/sentrylog:latest
+    container_name: myclover-sentrylog
+    restart: unless-stopped
+    ports:
+      - "8514:8514"     # Dashboard
+      - "514:514/udp"   # Syslog UDP
+      - "514:514/tcp"   # Syslog TCP
+    volumes:
+      - sentrylog-data:/app/data
+    environment:
+      - TZ=America/Los_Angeles
+    networks:
+      - myclover
+
+volumes:
+  sentrylog-data:
+    driver: local
+
+networks:
+  myclover:
+    driver: bridge
