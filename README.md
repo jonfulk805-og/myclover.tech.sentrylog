@@ -39,7 +39,55 @@ Part of the [MyClover.Tech](https://myclover.tech) suite. Can run standalone or 
 
 ---
 
-## Quick Start
+## 🐳 Docker (Recommended)
+
+The fastest way to get SentryLog running. Requires [Docker](https://docs.docker.com/get-docker/) (and optionally [Portainer](https://www.portainer.io/) for management).
+
+### Quick Start
+
+```bash
+docker run -d \
+  --name myclover-sentrylog \
+  --restart unless-stopped \
+  -p 8514:8514 \
+  -p 514:514/udp \
+  -p 514:514/tcp \
+  -v sentrylog-data:/app/data \
+  ghcr.io/jonfulk805-og/myclover-sentrylog:latest
+```
+
+Then open **http://localhost:8514** in your browser. Point your devices' syslog at this server on port 514.
+
+### Docker Compose
+
+```bash
+curl -O https://raw.githubusercontent.com/jonfulk805-og/myclover.tech.sentrylog/main/docker-compose.yml
+docker compose up -d
+```
+
+### Custom Configuration
+
+Mount your own `sentrylog_config.yaml` to customize settings:
+
+```bash
+docker run -d \
+  --name myclover-sentrylog \
+  --restart unless-stopped \
+  -p 8514:8514 \
+  -p 514:514/udp \
+  -p 514:514/tcp \
+  -v sentrylog-data:/app/data \
+  -v $(pwd)/sentrylog_config.yaml:/app/sentrylog_config.yaml \
+  ghcr.io/jonfulk805-og/myclover-sentrylog:latest
+```
+
+### Portainer
+
+In Portainer, create a new Stack and paste the contents of `docker-compose.yml`. Click **Deploy the stack**.
+
+---
+
+## Manual Install (Python)
 
 ### Requirements
 
