@@ -1,0 +1,32 @@
+# MyClover.Tech.SentryLog - Docker Compose
+# Quick Start: docker compose up -d
+# Dashboard: http://localhost:8514
+# Syslog:    UDP/TCP port 514
+#
+# Mount your own sentrylog_config.yaml to customize settings:
+#   volumes:
+#     - ./my-config.yaml:/app/sentrylog_config.yaml
+
+services:
+  sentrylog:
+    image: ghcr.io/jonfulk805-og/myclover-sentrylog:latest
+    container_name: myclover-sentrylog
+    restart: unless-stopped
+    ports:
+      - "8514:8514"
+      - "514:514/udp"
+      - "514:514/tcp"
+    volumes:
+      - sentrylog-data:/app/data
+      # Uncomment to use your own config:
+      # - ./sentrylog_config.yaml:/app/sentrylog_config.yaml
+    environment:
+      - TZ=America/Los_Angeles
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8514/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  sentrylog-data:
