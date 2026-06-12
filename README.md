@@ -49,14 +49,14 @@ The fastest way to get SentryLog running. Requires [Docker](https://docs.docker.
 docker run -d \
   --name myclover-sentrylog \
   --restart unless-stopped \
-  -p 8514:8514 \
-  -p 514:514/udp \
-  -p 514:514/tcp \
+  --network host \
   -v sentrylog-data:/app/data \
   ghcr.io/jonfulk805-og/myclover-sentrylog:latest
 ```
 
 Then open **http://localhost:8514** in your browser. Point your devices' syslog at this server on port 514.
+
+> **⚠️ Why `--network host`?** SentryLog needs to see the real source IP of devices sending syslog. Docker's default bridge networking performs NAT, which causes all log sources to appear as the Docker gateway IP (e.g. `172.x.x.1`) instead of the actual device IPs. Host networking solves this by letting the container share the host's network stack directly. Ports 514 and 8514 bind directly to the host — make sure they're available.
 
 ### Docker Compose
 
@@ -73,9 +73,7 @@ Mount your own `sentrylog_config.yaml` to customize settings:
 docker run -d \
   --name myclover-sentrylog \
   --restart unless-stopped \
-  -p 8514:8514 \
-  -p 514:514/udp \
-  -p 514:514/tcp \
+  --network host \
   -v sentrylog-data:/app/data \
   -v $(pwd)/sentrylog_config.yaml:/app/sentrylog_config.yaml \
   ghcr.io/jonfulk805-og/myclover-sentrylog:latest
