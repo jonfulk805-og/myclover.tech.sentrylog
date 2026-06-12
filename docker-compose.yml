@@ -3,6 +3,9 @@
 # Dashboard: http://localhost:8514
 # Syslog:    UDP/TCP port 514
 #
+# IMPORTANT: For syslog to show real device source IPs instead of the Docker
+# gateway IP (e.g. 172.x.x.1), use network_mode: host (see below).
+#
 # Mount your own sentrylog_config.yaml to customize settings:
 #   volumes:
 #     - ./my-config.yaml:/app/sentrylog_config.yaml
@@ -12,10 +15,26 @@ services:
     image: ghcr.io/jonfulk805-og/myclover-sentrylog:latest
     container_name: myclover-sentrylog
     restart: unless-stopped
-    ports:
-      - "8514:8514"
-      - "514:514/udp"
-      - "514:514/tcp"
+
+    # --- Network Mode ---
+    # Use "host" so syslog sees real source IPs from devices.
+    # Bridge mode (default) causes all sources to appear as the Docker
+    # gateway IP because Docker NATs incoming traffic.
+    network_mode: host
+
+    # NOTE: "ports:" is not used with network_mode: host.
+    # The container binds directly to the host's ports:
+    #   - 8514  (dashboard)
+    #   - 514   (syslog UDP + TCP)
+    # Make sure nothing else on the host is using these ports.
+
+    # If you prefer bridge mode (source IPs will show Docker gateway):
+    # network_mode: bridge   # (or just remove the network_mode line)
+    # ports:
+    #   - "8514:8514"
+    #   - "514:514/udp"
+    #   - "514:514/tcp"
+
     volumes:
       - sentrylog-data:/app/data
       # Uncomment to use your own config:
