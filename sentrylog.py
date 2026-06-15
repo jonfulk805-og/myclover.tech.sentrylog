@@ -715,7 +715,7 @@ def parse_syslog_message(data, source_ip):
     Parse a syslog message (RFC 3164 or RFC 5424).
     Returns a dict with parsed fields.
     """
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     result = {
         "timestamp": now,
@@ -788,6 +788,9 @@ def parse_syslog_message(data, source_ip):
                 dt = datetime.datetime.fromisoformat(
                     ts_str.replace("Z", "+00:00")
                 )
+                # Convert to local time if timezone-aware
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone().replace(tzinfo=None)
                 result["timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, TypeError):
             pass
@@ -820,7 +823,7 @@ def parse_syslog_message(data, source_ip):
 
         # Parse timestamp (add current year)
         try:
-            year = datetime.datetime.utcnow().year
+            year = datetime.datetime.now().year
             dt = datetime.datetime.strptime(
                 "%d %s" % (year, ts_str), "%Y %b %d %H:%M:%S"
             )
@@ -923,7 +926,7 @@ def _flush_logs():
 
 def _check_alert_rules(cursor, entry, log_id):
     """Check a log entry against all enabled alert rules."""
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         rules = cursor.execute(
             "SELECT * FROM alert_rules WHERE enabled = 1"
@@ -939,7 +942,7 @@ def _check_alert_rules(cursor, entry, log_id):
                     rule["last_fired"], "%Y-%m-%d %H:%M:%S"
                 )
                 cooldown = datetime.timedelta(minutes=rule["cooldown_minutes"])
-                if datetime.datetime.utcnow() - last < cooldown:
+                if datetime.datetime.now() - last < cooldown:
                     continue
             except ValueError:
                 pass
@@ -1058,7 +1061,7 @@ def _send_alert_notifications(cursor, rule_name, severity, source_ip, message):
     if not features.get("email_notifications"):
         return
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     # Global notification cooldown
@@ -1179,7 +1182,7 @@ def _send_alert_notifications(cursor, rule_name, severity, source_ip, message):
 # ---------------------------------------------------------------------------
 def _compute_next_run(schedule, last_run_str=""):
     """Compute the next run time for a schedule (daily, weekly, monthly)."""
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now()
     if schedule == "daily":
         # Run at 06:00 UTC each day
         nxt = now.replace(hour=6, minute=0, second=0, microsecond=0)
@@ -1224,7 +1227,7 @@ def _check_scheduled_reports():
     if not features.get("scheduled_reports"):
         return
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
@@ -1300,7 +1303,7 @@ _file_tail_stops = {}     # target_id -> threading.Event
 
 def _parse_syslog_file_line(line, source_name, default_facility, default_severity):
     """Parse a line from a syslog-style log file."""
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = {
         "timestamp": now,
         "received_at": now,
@@ -1346,7 +1349,7 @@ def _parse_syslog_file_line(line, source_name, default_facility, default_severit
         entry["source_name"] = m.group(2) if not source_name else source_name
         rest = m.group(3)
         try:
-            year = datetime.datetime.utcnow().year
+            year = datetime.datetime.now().year
             dt = datetime.datetime.strptime(
                 "%d %s" % (year, ts_str), "%Y %b %d %H:%M:%S"
             )
@@ -1434,7 +1437,7 @@ def _tail_file(target_id, file_path, source_name, default_facility,
 
             # Update DB with new position
             if lines_read > 0:
-                now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 try:
                     conn = get_db()
                     conn.execute(
@@ -1568,7 +1571,7 @@ def _forward_to_target(target, entry):
     """Forward a single log entry to a forwarding target."""
     tid = target["id"]
     ttype = target["target_type"]
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if ttype == "syslog":
         # Build syslog message
@@ -1678,12 +1681,12 @@ def validate_api_key(raw_key):
         if row:
             # Check expiration
             if row["expires_at"]:
-                now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if row["expires_at"] < now_str:
                     conn.close()
                     return None
             # Update usage
-            now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             conn.execute(
                 "UPDATE api_keys SET last_used = ?, use_count = use_count + 1 "
                 "WHERE id = ?", (now, row["id"])
@@ -1885,7 +1888,7 @@ def cleanup_old_logs():
     retention_days = min(cfg_days, max_days)
 
     cutoff = (
-        datetime.datetime.utcnow() - datetime.timedelta(days=retention_days)
+        datetime.datetime.now() - datetime.timedelta(days=retention_days)
     ).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -1950,7 +1953,7 @@ def _winlog_event_to_log(event_dict, source_ip, source_name):
     """Convert a Windows Event Log dict into the standard log format."""
     severity = event_dict.get("severity", "info")
     sev_code = SEVERITY_CODE_MAP.get(severity, 6)
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ts = event_dict.get("timestamp", now)
     return {
         "timestamp": ts,
@@ -1970,7 +1973,7 @@ def _winlog_event_to_log(event_dict, source_ip, source_name):
 
 def _update_winlog_target(target_id, **kwargs):
     """Update a winlog target in the database."""
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     sets = []
     params = []
@@ -2115,7 +2118,7 @@ def _collect_local_winlog(target_id, channels, poll_interval):
                 _flush_logs()
 
         bm_json = json_mod.dumps(bookmarks)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _update_winlog_target(
             target_id,
             last_poll=now,
@@ -2228,7 +2231,7 @@ def _collect_remote_winlog(target_id, hostname, username, password,
             break
 
         total_new = 0
-        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             session = winrm.Session(
@@ -2470,7 +2473,7 @@ def _normalize_security_event(event, connector_type, source_name):
     Each vendor normalizer returns a dict with at minimum:
       source_ip, source_name, facility, severity, message, program, pid, raw
     """
-    now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     base = {
         "timestamp": event.get("timestamp", now_str),
         "source_ip": event.get("source_ip", "0.0.0.0"),
@@ -2522,7 +2525,7 @@ def _poll_crowdstrike(connector_id, api_url, api_key, api_secret,
 
         if not det_ids:
             _update_security_connector(connector_id, error_message="",
-                                       last_poll=datetime.datetime.utcnow().strftime(
+                                       last_poll=datetime.datetime.now().strftime(
                                            "%Y-%m-%d %H:%M:%S"))
             return last_cursor
 
@@ -2570,7 +2573,7 @@ def _poll_crowdstrike(connector_id, api_url, api_key, api_secret,
         _update_security_connector(
             connector_id, error_message="",
             log_count=count,
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=newest_time or last_cursor
         )
         # Increment count in DB
@@ -2585,7 +2588,7 @@ def _poll_crowdstrike(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] CrowdStrike error: %s", exc)
         return last_cursor
@@ -2655,7 +2658,7 @@ def _poll_sentinelone(connector_id, api_url, api_key, api_secret,
 
         _update_security_connector(
             connector_id, error_message="",
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=next_cursor or last_cursor
         )
         conn = get_db()
@@ -2669,7 +2672,7 @@ def _poll_sentinelone(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] SentinelOne error: %s", exc)
         return last_cursor
@@ -2764,7 +2767,7 @@ def _poll_defender(connector_id, api_url, api_key, api_secret,
 
         _update_security_connector(
             connector_id, error_message="",
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=newest_time or last_cursor
         )
         conn = get_db()
@@ -2778,7 +2781,7 @@ def _poll_defender(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] Defender error: %s", exc)
         return last_cursor
@@ -2877,7 +2880,7 @@ def _poll_sophos(connector_id, api_url, api_key, api_secret,
 
         _update_security_connector(
             connector_id, error_message="",
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=next_key or last_cursor
         )
         conn = get_db()
@@ -2891,7 +2894,7 @@ def _poll_sophos(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] Sophos error: %s", exc)
         return last_cursor
@@ -2974,7 +2977,7 @@ def _poll_cortex_xdr(connector_id, api_url, api_key, api_secret,
             hosts = inc.get("hosts", ["unknown"])
             hostname = hosts[0] if hosts else "unknown"
 
-            ts_str = datetime.datetime.utcfromtimestamp(
+            ts_str = datetime.datetime.fromtimestamp(
                 creation_time / 1000.0
             ).strftime("%Y-%m-%d %H:%M:%S") if creation_time else ""
 
@@ -3000,7 +3003,7 @@ def _poll_cortex_xdr(connector_id, api_url, api_key, api_secret,
         new_cursor = str(newest_ts) if newest_ts else last_cursor
         _update_security_connector(
             connector_id, error_message="",
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=new_cursor
         )
         conn = get_db()
@@ -3014,7 +3017,7 @@ def _poll_cortex_xdr(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] Cortex XDR error: %s", exc)
         return last_cursor
@@ -3118,7 +3121,7 @@ def _poll_generic_api(connector_id, api_url, api_key, api_secret,
 
         _update_security_connector(
             connector_id, error_message="",
-            last_poll=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            last_poll=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             last_cursor=next_cursor or last_cursor
         )
         conn = get_db()
@@ -3132,7 +3135,7 @@ def _poll_generic_api(connector_id, api_url, api_key, api_secret,
     except Exception as exc:
         _update_security_connector(connector_id,
                                    error_message=str(exc)[:500],
-                                   last_poll=datetime.datetime.utcnow().strftime(
+                                   last_poll=datetime.datetime.now().strftime(
                                        "%Y-%m-%d %H:%M:%S"))
         log.error("[Connector] Generic API error: %s", exc)
         return last_cursor
@@ -3350,7 +3353,7 @@ def _run_correlation_check():
         "FROM correlation_rules WHERE enabled = 1"
     ).fetchall()
 
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     with _correlation_lock:
@@ -3613,7 +3616,7 @@ def _generate_compliance_report(report_id, template, date_from, date_to,
         ).fetchall()
 
         # ---- Build HTML report ----
-        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         html = []
         html.append("<!DOCTYPE html>")
         html.append("<html><head>")
@@ -3849,7 +3852,7 @@ def _fmt_num(n):
 def get_stats(hours=24):
     """Get dashboard statistics."""
     cutoff = (
-        datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+        datetime.datetime.now() - datetime.timedelta(hours=hours)
     ).strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_db()
@@ -3964,7 +3967,7 @@ if HAS_FLASK:
         sort = request.args.get("sort", "desc")
 
         cutoff = (
-            datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+            datetime.datetime.now() - datetime.timedelta(hours=hours)
         ).strftime("%Y-%m-%d %H:%M:%S")
 
         conn = get_db()
@@ -4085,7 +4088,7 @@ if HAS_FLASK:
     @app.route("/api/rules", methods=["POST"])
     def api_create_rule():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Check rule limit
         features = get_tier_features()
@@ -4126,7 +4129,7 @@ if HAS_FLASK:
     @app.route("/api/rules/<int:rule_id>", methods=["PUT"])
     def api_update_rule(rule_id):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         conn.execute("""
             UPDATE alert_rules SET name = ?, description = ?, pattern = ?,
@@ -4180,7 +4183,7 @@ if HAS_FLASK:
 
     @app.route("/api/alerts/<int:alert_id>/ack", methods=["POST"])
     def api_ack_alert(alert_id):
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         conn.execute("""
             UPDATE alerts SET acknowledged = 1, ack_at = ?, ack_by = 'dashboard'
@@ -4192,7 +4195,7 @@ if HAS_FLASK:
 
     @app.route("/api/alerts/ack-all", methods=["POST"])
     def api_ack_all_alerts():
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         conn.execute("""
             UPDATE alerts SET acknowledged = 1, ack_at = ?, ack_by = 'dashboard'
@@ -4288,7 +4291,7 @@ if HAS_FLASK:
     @require_tier(TIER_ENT)
     def api_create_winlog_target():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         target_type = data.get("target_type", "local")
 
         conn = get_db()
@@ -4341,7 +4344,7 @@ if HAS_FLASK:
     @require_tier(TIER_ENT)
     def api_update_winlog_target(target_id):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         conn = get_db()
         # If password is masked, keep the old one
@@ -4535,7 +4538,7 @@ if HAS_FLASK:
             return jsonify({"error": True,
                             "message": "Invalid connector type."}), 400
 
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         extra = data.get("extra_config", "{}")
         if isinstance(extra, dict):
             extra = json_mod.dumps(extra)
@@ -4578,7 +4581,7 @@ if HAS_FLASK:
     @require_tier(TIER_ENT)
     def api_update_security_connector(cid):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Stop existing collector before update
         stop_security_connector(cid)
@@ -4857,7 +4860,7 @@ if HAS_FLASK:
         token = data.get("token", "").strip() or secrets_mod.token_urlsafe(32)
         label = data.get("label", "").strip() or "Webhook"
         source_name = data.get("source_name", "").strip() or "webhook"
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         conn = get_db()
         c = conn.execute(
@@ -4922,7 +4925,7 @@ if HAS_FLASK:
         if isinstance(conditions, list):
             conditions = json_mod.dumps(conditions)
 
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         c = conn.execute(
             "INSERT INTO correlation_rules "
@@ -4948,7 +4951,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_update_corr_rule(rid):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         conn = get_db()
         fields = []
@@ -5024,7 +5027,7 @@ if HAS_FLASK:
                methods=["POST"])
     @require_tier(TIER_PRO)
     def api_ack_corr_incident(iid):
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         conn.execute(
             "UPDATE correlation_incidents SET acknowledged = 1, "
@@ -5038,7 +5041,7 @@ if HAS_FLASK:
                methods=["POST"])
     @require_tier(TIER_PRO)
     def api_close_corr_incident(iid):
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         conn.execute(
             "UPDATE correlation_incidents SET status = 'closed', "
@@ -5107,7 +5110,7 @@ if HAS_FLASK:
         if isinstance(params, dict):
             params = json_mod.dumps(params)
 
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         c = conn.execute(
             "INSERT INTO compliance_reports "
@@ -5223,7 +5226,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_create_notification_channel():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         name = data.get("name", "Untitled")
         ch_type = data.get("channel_type", "email")
         config = json_mod.dumps(data.get("config", {}))
@@ -5355,7 +5358,7 @@ if HAS_FLASK:
     @require_tier(TIER_ENT)
     def api_create_scheduled_report():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         name = data.get("name", "Untitled Schedule")
         template = data.get("template", "custom")
         schedule = data.get("schedule", "weekly")
@@ -5379,7 +5382,7 @@ if HAS_FLASK:
     @require_tier(TIER_ENT)
     def api_update_scheduled_report(sid):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         row = conn.execute(
             "SELECT * FROM scheduled_reports WHERE id = ?", (sid,)
@@ -5433,7 +5436,7 @@ if HAS_FLASK:
         limit = request.args.get("limit", 10000, type=int)
 
         cutoff = (
-            datetime.datetime.utcnow() - datetime.timedelta(hours=hours)
+            datetime.datetime.now() - datetime.timedelta(hours=hours)
         ).strftime("%Y-%m-%d %H:%M:%S")
 
         where = ["received_at >= ?"]
@@ -5504,7 +5507,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_create_file_target():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fp = data.get("file_path", "")
         if not fp:
             return jsonify({"error": "file_path required"}), 400
@@ -5545,7 +5548,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_update_file_target(tid):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         row = conn.execute(
             "SELECT * FROM file_targets WHERE id = ?", (tid,)
@@ -5602,7 +5605,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_create_forwarding_target():
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         name = data.get("name", "Untitled")
         ttype = data.get("target_type", "syslog")
         host = data.get("host", "")
@@ -5640,7 +5643,7 @@ if HAS_FLASK:
     @require_tier(TIER_PRO)
     def api_update_forwarding_target(fid):
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_db()
         row = conn.execute(
             "SELECT * FROM forwarding_targets WHERE id = ?", (fid,)
@@ -5718,10 +5721,10 @@ if HAS_FLASK:
         expires_days = data.get("expires_days", 0)
 
         raw_key, key_hash, prefix = generate_api_key()
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         expires = ""
         if expires_days > 0:
-            exp_dt = datetime.datetime.utcnow() + datetime.timedelta(days=expires_days)
+            exp_dt = datetime.datetime.now() + datetime.timedelta(days=expires_days)
             expires = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         conn = get_db()
@@ -5778,7 +5781,7 @@ if HAS_FLASK:
     def api_test_log():
         """Inject a test log entry (useful for testing without real syslog sources)."""
         data = request.get_json(force=True)
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = {
             "timestamp": now,
             "received_at": now,

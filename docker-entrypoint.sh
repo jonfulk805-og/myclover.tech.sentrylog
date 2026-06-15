@@ -2,7 +2,7 @@
 set -e
 
 echo "=== MyClover.Tech.SentryLog ==="
-echo "Starting at $(date -u)"
+echo "Starting at $(date) (TZ=${TZ:-UTC})"
 
 # Copy default config if user hasn't mounted one
 if [ ! -f /app/sentrylog_config.yaml ]; then

@@ -7,10 +7,14 @@ LABEL org.opencontainers.image.title="MyClover.Tech.SentryLog"
 LABEL org.opencontainers.image.description="Log aggregation, SIEM-lite, syslog receiver, security alerting, and compliance reporting"
 LABEL org.opencontainers.image.vendor="MyClover.Tech"
 
-# Install minimal system deps
+# Install minimal system deps + timezone data
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Default timezone (override with TZ env variable)
+ENV TZ=America/Los_Angeles
 
 WORKDIR /app
 
