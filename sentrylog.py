@@ -51,6 +51,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from collections import defaultdict
+import zipfile
+import shutil
 
 # ---------------------------------------------------------------------------
 # Optional imports
@@ -104,6 +106,22 @@ VERSION = "6.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "sentrylog.db"
 DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
+BACKUP_DIR = BASE_DIR / "backups"
+
+# Tables that hold configuration (backed up). Logs/alerts are NOT included.
+BACKUP_CONFIG_TABLES = [
+    "sources",
+    "alert_rules",
+    "winlog_targets",
+    "security_connectors",
+    "webhook_tokens",
+    "correlation_rules",
+    "notification_channels",
+    "scheduled_reports",
+    "file_targets",
+    "forwarding_targets",
+    "api_keys",
+]
 
 _config = {}
 _config_lock = threading.Lock()
@@ -3972,6 +3990,159 @@ def get_stats(hours=24):
 
 
 # ---------------------------------------------------------------------------
+# Backup & Restore helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_backup_dir():
+    """Create the backups directory if it does not exist."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def create_backup(note=""):
+    """Create a ZIP backup of config YAML + all configuration DB tables.
+
+    Returns (filename, full_path) of the created backup.
+    """
+    _ensure_backup_dir()
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = "sentrylog_backup_%s.zip" % ts
+    zip_path = BACKUP_DIR / filename
+
+    conn = get_db()
+    try:
+        with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+            # 1) Config YAML
+            if Path(DEFAULT_CFG).exists():
+                zf.write(str(DEFAULT_CFG), "sentrylog_config.yaml")
+
+            # 2) Configuration tables as JSON
+            for table in BACKUP_CONFIG_TABLES:
+                try:
+                    cur = conn.execute("SELECT * FROM %s" % table)
+                    cols = [d[0] for d in cur.description]
+                    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                    zf.writestr(
+                        "tables/%s.json" % table,
+                        json_mod.dumps(rows, indent=2, default=str),
+                    )
+                except Exception:
+                    pass  # table may not exist yet
+
+            # 3) Metadata
+            meta = {
+                "created_at": datetime.datetime.now().isoformat(),
+                "version": VERSION,
+                "tier": get_tier(),
+                "note": note,
+                "tables": BACKUP_CONFIG_TABLES,
+            }
+            zf.writestr("backup_meta.json", json_mod.dumps(meta, indent=2))
+    finally:
+        conn.close()
+
+    log.info("Backup created: %s", filename)
+    return filename, str(zip_path)
+
+
+def list_backups():
+    """Return a list of available backups with metadata."""
+    _ensure_backup_dir()
+    backups = []
+    for fp in sorted(BACKUP_DIR.glob("sentrylog_backup_*.zip"), reverse=True):
+        info = {"filename": fp.name, "size_bytes": fp.stat().st_size}
+        try:
+            with zipfile.ZipFile(str(fp), "r") as zf:
+                if "backup_meta.json" in zf.namelist():
+                    meta = json_mod.loads(zf.read("backup_meta.json"))
+                    info["created_at"] = meta.get("created_at", "")
+                    info["version"] = meta.get("version", "")
+                    info["tier"] = meta.get("tier", "")
+                    info["note"] = meta.get("note", "")
+                else:
+                    info["created_at"] = ""
+                    info["version"] = ""
+                    info["tier"] = ""
+                    info["note"] = ""
+        except Exception:
+            info["created_at"] = ""
+            info["version"] = ""
+            info["tier"] = ""
+            info["note"] = ""
+        backups.append(info)
+    return backups
+
+
+def restore_backup(zip_path, restore_config=True, restore_tables=True):
+    """Restore from a backup ZIP.
+
+    Returns a dict with restore summary.
+    """
+    summary = {"config_restored": False, "tables_restored": [], "errors": []}
+
+    with zipfile.ZipFile(str(zip_path), "r") as zf:
+        names = zf.namelist()
+
+        # 1) Restore config YAML
+        if restore_config and "sentrylog_config.yaml" in names:
+            cfg_data = zf.read("sentrylog_config.yaml").decode("utf-8")
+            # Backup current config first
+            if Path(DEFAULT_CFG).exists():
+                bak = str(DEFAULT_CFG) + ".pre_restore"
+                shutil.copy2(str(DEFAULT_CFG), bak)
+            with open(str(DEFAULT_CFG), "w", encoding="utf-8") as f:
+                f.write(cfg_data)
+            # Reload into memory
+            load_config()
+            summary["config_restored"] = True
+
+        # 2) Restore configuration tables
+        if restore_tables:
+            conn = get_db()
+            try:
+                for table in BACKUP_CONFIG_TABLES:
+                    json_name = "tables/%s.json" % table
+                    if json_name not in names:
+                        continue
+                    try:
+                        rows = json_mod.loads(zf.read(json_name))
+                        if not rows:
+                            summary["tables_restored"].append(table)
+                            continue
+                        # Clear existing rows
+                        conn.execute("DELETE FROM %s" % table)
+                        # Insert restored rows
+                        cols = list(rows[0].keys())
+                        placeholders = ", ".join(["?"] * len(cols))
+                        col_str = ", ".join(cols)
+                        sql = "INSERT INTO %s (%s) VALUES (%s)" % (
+                            table, col_str, placeholders)
+                        for row in rows:
+                            vals = [row.get(c) for c in cols]
+                            conn.execute(sql, vals)
+                        summary["tables_restored"].append(table)
+                    except Exception as exc:
+                        summary["errors"].append(
+                            "%s: %s" % (table, str(exc)))
+                conn.commit()
+            finally:
+                conn.close()
+
+    log.info("Backup restored: config=%s, tables=%s",
+             summary["config_restored"], summary["tables_restored"])
+    return summary
+
+
+def delete_backup(filename):
+    """Delete a backup file. Returns True on success."""
+    fp = BACKUP_DIR / filename
+    if fp.exists() and fp.suffix == ".zip":
+        fp.unlink()
+        log.info("Backup deleted: %s", filename)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Flask Dashboard & API
 # ---------------------------------------------------------------------------
 if HAS_FLASK:
@@ -5834,6 +6005,104 @@ if HAS_FLASK:
         with _log_buffer_lock:
             _flush_logs()
         return jsonify({"status": "ok", "entry": entry})
+
+    # ---- Backup & Restore ----
+
+    @app.route("/api/backup/list")
+    @optional_api_auth
+    def api_backup_list():
+        return jsonify({"backups": list_backups()})
+
+    @app.route("/api/backup/create", methods=["POST"])
+    @optional_api_auth
+    def api_backup_create():
+        data = request.get_json(silent=True) or {}
+        note = data.get("note", "")
+        try:
+            filename, path = create_backup(note=note)
+            return jsonify({
+                "status": "ok",
+                "filename": filename,
+                "message": "Backup created successfully",
+            })
+        except Exception as exc:
+            log.error("Backup creation failed: %s", exc)
+            return jsonify({
+                "error": True,
+                "message": "Backup failed: %s" % str(exc),
+            }), 500
+
+    @app.route("/api/backup/download/<filename>")
+    @optional_api_auth
+    def api_backup_download(filename):
+        safe_name = Path(filename).name
+        fp = BACKUP_DIR / safe_name
+        if not fp.exists() or fp.suffix != ".zip":
+            return jsonify({"error": True, "message": "Backup not found"}), 404
+        return send_file(
+            str(fp),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=safe_name,
+        )
+
+    @app.route("/api/backup/restore", methods=["POST"])
+    @optional_api_auth
+    def api_backup_restore():
+        restore_cfg = request.form.get("restore_config", "true") == "true"
+        restore_tbl = request.form.get("restore_tables", "true") == "true"
+
+        if "file" in request.files:
+            f = request.files["file"]
+            if not f.filename.endswith(".zip"):
+                return jsonify({
+                    "error": True,
+                    "message": "Invalid file -- must be a .zip backup",
+                }), 400
+            _ensure_backup_dir()
+            tmp_path = BACKUP_DIR / ("_upload_%s" % f.filename)
+            f.save(str(tmp_path))
+            try:
+                summary = restore_backup(
+                    tmp_path,
+                    restore_config=restore_cfg,
+                    restore_tables=restore_tbl,
+                )
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+        elif request.form.get("filename"):
+            safe_name = Path(request.form["filename"]).name
+            fp = BACKUP_DIR / safe_name
+            if not fp.exists():
+                return jsonify({
+                    "error": True,
+                    "message": "Backup file not found",
+                }), 404
+            summary = restore_backup(
+                fp,
+                restore_config=restore_cfg,
+                restore_tables=restore_tbl,
+            )
+        else:
+            return jsonify({
+                "error": True,
+                "message": "No backup file provided",
+            }), 400
+
+        return jsonify({
+            "status": "ok",
+            "message": "Restore completed",
+            "summary": summary,
+        })
+
+    @app.route("/api/backup/<filename>", methods=["DELETE"])
+    @optional_api_auth
+    def api_backup_delete(filename):
+        safe_name = Path(filename).name
+        if delete_backup(safe_name):
+            return jsonify({"status": "ok", "message": "Backup deleted"})
+        return jsonify({"error": True, "message": "Backup not found"}), 404
 
     @app.route("/api/version")
     def api_version():

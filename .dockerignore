@@ -12,3 +12,5 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+backups/
+*.pre_restore
