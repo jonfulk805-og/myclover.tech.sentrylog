@@ -30,3 +30,7 @@ Thumbs.db
 # Config overrides (keep template, ignore local)
 # sentrylog_config.yaml is tracked -- local overrides go here:
 sentrylog_config.local.yaml
+
+# Backups (local only, not tracked in git)
+backups/
+*.pre_restore
