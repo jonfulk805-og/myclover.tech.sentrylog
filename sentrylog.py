@@ -3179,6 +3179,7 @@ def _connector_poll_loop(connector_id, connector_type, api_url, api_key,
     log.info("[Connector] Starting %s connector (id=%d, interval=%ds)",
              connector_type, connector_id, poll_interval)
 
+    _db_fail_count = 0
     while not stop_event.is_set():
         # Check if still enabled
         try:
@@ -3188,12 +3189,25 @@ def _connector_poll_loop(connector_id, connector_type, api_url, api_key,
                 (connector_id,)
             ).fetchone()
             conn.close()
+            _db_fail_count = 0  # Reset on success
             if not row or not row[0]:
                 log.info("[Connector] Connector %d disabled, stopping",
                          connector_id)
                 break
-        except Exception:
-            break
+        except Exception as exc:
+            _db_fail_count += 1
+            log.warning("[Connector] DB check failed for connector %d "
+                        "(attempt %d): %s", connector_id, _db_fail_count, exc)
+            if _db_fail_count >= 5:
+                log.error("[Connector] Too many DB failures for connector %d, "
+                          "stopping", connector_id)
+                _update_security_connector(
+                    connector_id,
+                    error_message="Polling stopped: repeated DB errors")
+                break
+            # Transient DB error -- wait and retry instead of dying
+            stop_event.wait(poll_interval)
+            continue
 
         try:
             cursor = poller(connector_id, api_url, api_key, api_secret,
