@@ -3944,6 +3944,19 @@ def get_stats(hours=24):
         {"hour": r["hour"], "count": r["cnt"]} for r in hourly
     ]
 
+    # Logs per hour per source (for stacked chart)
+    hourly_src = c.execute("""
+        SELECT strftime('%%Y-%%m-%%d %%H:00:00', received_at) as hour,
+               source_ip, source_name, COUNT(*) as cnt
+        FROM logs WHERE received_at >= ?
+        GROUP BY hour, source_ip ORDER BY hour, cnt DESC
+    """, (cutoff,)).fetchall()
+    stats["hourly_volume_by_source"] = [
+        {"hour": r["hour"], "source_ip": r["source_ip"],
+         "source_name": r["source_name"], "count": r["cnt"]}
+        for r in hourly_src
+    ]
+
     # Recent alerts
     recent_alerts = c.execute("""
         SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 10
