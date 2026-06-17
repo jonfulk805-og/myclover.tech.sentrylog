@@ -47,6 +47,7 @@ import io
 import smtplib
 import secrets
 import functools
+import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -1789,6 +1790,81 @@ def _buffer_flush_loop():
         with _log_buffer_lock:
             if _log_buffer:
                 _flush_logs()
+
+
+# ---------------------------------------------------------------------------
+# User Authentication (token-based, stored in config.yaml)
+# ---------------------------------------------------------------------------
+_USER_AUTH_SECRET = b"sentrylog-user-auth-2026"
+_USER_AUTH_TOKEN_EXPIRY = 86400  # 24 hours
+
+USER_AUTH_ROLES = {
+    "admin": {"read", "write", "config", "users"},
+    "operator": {"read", "write"},
+    "viewer": {"read"},
+}
+
+
+def _generate_user_token(username, role):
+    """Generate a signed token for a user."""
+    expires = int(time.time()) + _USER_AUTH_TOKEN_EXPIRY
+    payload = "%s:%s:%d" % (username, role, expires)
+    sig = hmac.new(_USER_AUTH_SECRET, payload.encode("utf-8"),
+                   hashlib.sha256).hexdigest()[:32]
+    token = base64.urlsafe_b64encode(
+        ("%s:%s" % (payload, sig)).encode("utf-8")).decode("ascii")
+    return token
+
+
+def _validate_user_token(token):
+    """Validate a token. Returns (username, role) or (None, None)."""
+    try:
+        decoded = base64.urlsafe_b64decode(
+            token.encode("utf-8")).decode("utf-8")
+        parts = decoded.rsplit(":", 1)
+        if len(parts) != 2:
+            return None, None
+        payload, provided_sig = parts
+        expected_sig = hmac.new(_USER_AUTH_SECRET, payload.encode("utf-8"),
+                                hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(provided_sig, expected_sig):
+            return None, None
+        username, role, expires_str = payload.split(":")
+        if int(expires_str) < int(time.time()):
+            return None, None
+        return username, role
+    except Exception:
+        return None, None
+
+
+def _check_user_auth(required_perm="read"):
+    """Check if user auth is enabled and if so, validate the request.
+    Returns (username, role) or aborts with 401.
+    """
+    with _config_lock:
+        users = _config.get("users", [])
+        auth_enabled = _config.get("auth_enabled", False)
+    if not auth_enabled or not users:
+        return ("admin", "admin")
+
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    if not token:
+        token = request.cookies.get("sentrylog_token", "")
+    if not token:
+        abort(401)
+
+    username, role = _validate_user_token(token)
+    if not username:
+        abort(401)
+
+    perms = USER_AUTH_ROLES.get(role, set())
+    if required_perm not in perms:
+        abort(403)
+
+    return (username, role)
 
 
 # ---------------------------------------------------------------------------
@@ -4455,6 +4531,7 @@ if HAS_FLASK:
             safe["storage"] = _config.get("storage", {})
             safe["dashboard"] = _config.get("dashboard", {})
             safe["netmon_integration"] = _config.get("netmon_integration", {})
+            safe["auth_enabled"] = _config.get("auth_enabled", False)
         return jsonify(safe)
 
     @app.route("/api/config", methods=["PUT"])
@@ -4466,8 +4543,110 @@ if HAS_FLASK:
                     if key not in _config:
                         _config[key] = {}
                     _config[key].update(data[key])
+            if "auth_enabled" in data:
+                _config["auth_enabled"] = bool(data["auth_enabled"])
         save_config(_config)
         return jsonify({"status": "ok"})
+
+    # ---- User Authentication ----
+    @app.route("/api/auth/login", methods=["POST"])
+    def api_auth_login():
+        data = request.get_json(force=True) if request.data else {}
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", "")).strip()
+        if not username or not password:
+            return jsonify({"error": "Username and password required"}), 400
+        with _config_lock:
+            users = _config.get("users", [])
+        for u in users:
+            if u.get("username") == username and u.get("password") == password:
+                role = u.get("role", "viewer")
+                token = _generate_user_token(username, role)
+                resp = jsonify({"token": token, "username": username,
+                                "role": role,
+                                "expires_in": _USER_AUTH_TOKEN_EXPIRY})
+                resp.set_cookie("sentrylog_token", token,
+                                max_age=_USER_AUTH_TOKEN_EXPIRY,
+                                httponly=True, samesite="Lax")
+                return resp
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    @app.route("/api/auth/logout", methods=["POST"])
+    def api_auth_logout():
+        resp = jsonify({"status": "logged_out"})
+        resp.delete_cookie("sentrylog_token")
+        return resp
+
+    @app.route("/api/auth/me")
+    def api_auth_me():
+        username, role = _check_user_auth()
+        return jsonify({"username": username, "role": role})
+
+    @app.route("/api/users", methods=["GET"])
+    def api_get_users():
+        _check_user_auth("users")
+        with _config_lock:
+            users = _config.get("users", [])
+        safe = [{"username": u["username"], "role": u.get("role", "viewer")}
+                for u in users]
+        return jsonify(safe)
+
+    @app.route("/api/users", methods=["POST"])
+    def api_add_user():
+        _check_user_auth("users")
+        data = request.get_json(force=True) if request.data else {}
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", "")).strip()
+        role = str(data.get("role", "viewer")).strip()
+        if not username or not password:
+            return jsonify({"error": "Username and password required"}), 400
+        if role not in USER_AUTH_ROLES:
+            return jsonify({"error": "Invalid role"}), 400
+        with _config_lock:
+            users = _config.get("users", [])
+            for u in users:
+                if u["username"] == username:
+                    return jsonify({"error": "User already exists"}), 409
+            users.append({"username": username,
+                          "password": password, "role": role})
+            _config["users"] = users
+            save_config(_config)
+        return jsonify({"status": "created",
+                        "username": username, "role": role})
+
+    @app.route("/api/users/<username>", methods=["PUT"])
+    def api_update_user(username):
+        _check_user_auth("users")
+        data = request.get_json(force=True) if request.data else {}
+        new_role = str(data.get("role", "")).strip()
+        new_password = str(data.get("password", "")).strip()
+        if new_role and new_role not in USER_AUTH_ROLES:
+            return jsonify({"error": "Invalid role"}), 400
+        with _config_lock:
+            users = _config.get("users", [])
+            found = False
+            for u in users:
+                if u["username"] == username:
+                    if new_role:
+                        u["role"] = new_role
+                    if new_password:
+                        u["password"] = new_password
+                    found = True
+                    break
+            if not found:
+                return jsonify({"error": "User not found"}), 404
+            save_config(_config)
+        return jsonify({"status": "updated", "username": username})
+
+    @app.route("/api/users/<username>", methods=["DELETE"])
+    def api_delete_user(username):
+        _check_user_auth("users")
+        with _config_lock:
+            users = _config.get("users", [])
+            _config["users"] = [u for u in users
+                                if u["username"] != username]
+            save_config(_config)
+        return jsonify({"status": "deleted"})
 
     # ---- Windows Event Log Targets (Phase 2) ----
     @app.route("/api/winlog/targets")

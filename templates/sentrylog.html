@@ -494,6 +494,28 @@ tr:hover td { background: rgba(34,197,94,0.03); }
 </style>
 </head>
 <body>
+
+<!-- ========== LOGIN OVERLAY ========== -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:var(--bg,#0d1117);z-index:9999;align-items:center;justify-content:center;">
+    <div style="background:var(--card-bg,#161b22);border:1px solid var(--border,#30363d);border-radius:12px;padding:40px;width:360px;max-width:90vw;">
+        <div style="text-align:center;margin-bottom:24px;">
+            <div style="font-size:32px;margin-bottom:8px;">&#x1F6E1;</div>
+            <h1 style="font-size:20px;color:var(--text,#e6edf3);margin:0;">SentryLog</h1>
+            <p style="color:var(--text-dim,#7d8590);font-size:12px;margin-top:4px;">Sign in to continue</p>
+        </div>
+        <div id="login-error" style="display:none;background:#3b1c1c;color:#ff6b6b;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px;"></div>
+        <div style="margin-bottom:14px;">
+            <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim,#7d8590);margin-bottom:6px;">Username</label>
+            <input type="text" id="login-username" style="width:100%;padding:10px 12px;background:var(--bg,#0d1117);border:1px solid var(--border,#30363d);border-radius:6px;color:var(--text,#e6edf3);font-size:14px;" autocomplete="username" onkeydown="if(event.key==='Enter')doLogin()">
+        </div>
+        <div style="margin-bottom:20px;">
+            <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim,#7d8590);margin-bottom:6px;">Password</label>
+            <input type="password" id="login-password" style="width:100%;padding:10px 12px;background:var(--bg,#0d1117);border:1px solid var(--border,#30363d);border-radius:6px;color:var(--text,#e6edf3);font-size:14px;" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
+        </div>
+        <button onclick="doLogin()" id="login-btn" style="width:100%;padding:10px;background:var(--accent,#58a6ff);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;">Sign In</button>
+    </div>
+</div>
+
 <!-- Navigation -->
 <nav class="nav">
   <div class="nav-brand">
@@ -517,6 +539,8 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
   <div class="nav-right">
+    <span id="auth-user-badge" style="display:none;font-size:12px;color:var(--text-dim);background:var(--card-bg);padding:3px 10px;border-radius:4px;border:1px solid var(--border);margin-right:8px;"></span>
+    <button id="logout-btn" onclick="doLogout()" style="display:none;padding:3px 10px;font-size:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:4px;cursor:pointer;margin-right:8px;">Logout</button>
     <span class="tier-badge tier-community" id="tierBadge">COMMUNITY</span>
   </div>
 </nav>
@@ -1089,6 +1113,67 @@ tr:hover td { background: rgba(34,197,94,0.03); }
 
     <div class="card">
       <div class="settings-section">
+        <h3>&#128274; Authentication</h3>
+        <div class="settings-row">
+          <label style="display:flex;align-items:center;gap:8px;">
+            <input type="checkbox" id="set-auth-enabled" style="accent-color:var(--accent);width:16px;height:16px;" onchange="toggleAuthUI()">
+            Enable user authentication (requires login to access dashboard)
+          </label>
+        </div>
+        <div id="auth-settings-panel" style="display:none;margin-top:16px;">
+          <h4 style="color:var(--text);font-size:14px;margin-bottom:12px;">Users</h4>
+          <table id="users-table" style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px;">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border);text-align:left;">
+                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;">Username</th>
+                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;">Role</th>
+                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;width:140px;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="users-tbody">
+              <tr><td colspan="3" style="padding:12px;color:var(--text-dim);text-align:center;">No users configured</td></tr>
+            </tbody>
+          </table>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:16px;">
+            <h4 style="color:var(--text);font-size:13px;margin-bottom:12px;">Add User</h4>
+            <div style="display:grid;grid-template-columns:1fr 1fr 120px auto;gap:10px;align-items:end;">
+              <div>
+                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Username</label>
+                <input type="text" id="new-user-name" placeholder="username" autocomplete="off" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Password</label>
+                <input type="password" id="new-user-pass" placeholder="password" autocomplete="new-password" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Role</label>
+                <select id="new-user-role" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
+                  <option value="admin">Admin</option>
+                  <option value="operator">Operator</option>
+                  <option value="viewer" selected>Viewer</option>
+                </select>
+              </div>
+              <button class="btn btn-primary" onclick="addUser()" style="height:34px;padding:0 16px;">Add</button>
+            </div>
+            <div id="add-user-result" style="font-size:12px;margin-top:8px;"></div>
+          </div>
+          <div style="margin-top:12px;padding:10px 14px;background:rgba(88,166,255,0.08);border:1px solid rgba(88,166,255,0.2);border-radius:6px;">
+            <div style="font-size:12px;color:var(--text-dim);">
+              <strong style="color:var(--text);">Roles:</strong>
+              <strong>Admin</strong> &mdash; Full access (settings, users, connectors)&nbsp;&nbsp;|&nbsp;&nbsp;
+              <strong>Operator</strong> &mdash; Can acknowledge alerts and manage rules&nbsp;&nbsp;|&nbsp;&nbsp;
+              <strong>Viewer</strong> &mdash; Read-only dashboard access
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:16px">
+          <button class="btn btn-primary" onclick="saveAuthSettings()">Save Authentication Settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="settings-section">
         <h3>License</h3>
         <div class="settings-row">
           <label>Current Tier:</label>
@@ -1487,6 +1572,9 @@ tr:hover td { background: rgba(34,197,94,0.03); }
    ============================================================ */
 
 // State
+var _authUser = null;
+var _authRole = null;
+
 let currentTab = 'overview';
 let liveMode = true;
 let liveInterval = null;
@@ -1524,7 +1612,7 @@ function switchTab(tab) {
   if (tab === 'notifications') refreshNotifications();
   if (tab === 'forwarding') refreshForwarding();
   if (tab === 'apikeys') refreshApiKeys();
-  if (tab === 'settings') { loadSettings(); loadBackups(); }
+  if (tab === 'settings') { loadSettings(); loadAuthSettings(); loadBackups(); }
 }
 
 // ------- API helpers -------
@@ -2814,6 +2902,184 @@ function loadSettings() {
   });
 }
 
+// ===== Authentication =====
+function checkAuth() {
+    fetch('/api/auth/me').then(function(r) {
+        if (r.status === 401) { showLoginScreen(); return null; }
+        return r.json();
+    }).then(function(d) {
+        if (!d) return;
+        _authUser = d.username; _authRole = d.role;
+        hideLoginScreen(); applyRoleRestrictions();
+    }).catch(function() {
+        fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
+            if (c.auth_enabled) { showLoginScreen(); }
+            else { _authUser = 'admin'; _authRole = 'admin'; hideLoginScreen(); }
+        });
+    });
+}
+
+function showLoginScreen() {
+    var ov = document.getElementById('login-overlay');
+    ov.style.display = 'flex';
+    setTimeout(function(){ document.getElementById('login-username').focus(); }, 100);
+}
+
+function hideLoginScreen() {
+    document.getElementById('login-overlay').style.display = 'none';
+    if (_authUser && _authUser !== 'admin') {
+        document.getElementById('auth-user-badge').textContent = _authUser + ' (' + _authRole + ')';
+        document.getElementById('auth-user-badge').style.display = 'inline';
+        document.getElementById('logout-btn').style.display = 'inline';
+    } else {
+        fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
+            if (c.auth_enabled && _authUser) {
+                document.getElementById('auth-user-badge').textContent = _authUser + ' (' + _authRole + ')';
+                document.getElementById('auth-user-badge').style.display = 'inline';
+                document.getElementById('logout-btn').style.display = 'inline';
+            }
+        }).catch(function(){});
+    }
+}
+
+function doLogin() {
+    var username = document.getElementById('login-username').value.trim();
+    var password = document.getElementById('login-password').value;
+    var errEl = document.getElementById('login-error');
+    var btn = document.getElementById('login-btn');
+    if (!username || !password) {
+        errEl.textContent = 'Please enter username and password.'; errEl.style.display = 'block'; return;
+    }
+    btn.disabled = true; btn.textContent = 'Signing in...';
+    fetch('/api/auth/login', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username: username, password: password})
+    }).then(function(r) {
+        return r.json().then(function(d) { d._status = r.status; return d; });
+    }).then(function(d) {
+        btn.disabled = false; btn.textContent = 'Sign In';
+        if (d._status === 200) {
+            _authUser = d.username; _authRole = d.role;
+            errEl.style.display = 'none';
+            document.getElementById('login-password').value = '';
+            hideLoginScreen(); applyRoleRestrictions();
+        } else {
+            errEl.textContent = d.error || 'Invalid credentials.'; errEl.style.display = 'block';
+        }
+    }).catch(function(e) {
+        btn.disabled = false; btn.textContent = 'Sign In';
+        errEl.textContent = 'Connection error: ' + e.message; errEl.style.display = 'block';
+    });
+}
+
+function doLogout() {
+    fetch('/api/auth/logout', { method: 'POST' }).then(function() {
+        _authUser = null; _authRole = null;
+        document.getElementById('auth-user-badge').style.display = 'none';
+        document.getElementById('logout-btn').style.display = 'none';
+        checkAuth();
+    });
+}
+
+function applyRoleRestrictions() {
+    var adminEls = document.querySelectorAll('[data-auth-role="admin"]');
+    for (var i = 0; i < adminEls.length; i++) {
+        adminEls[i].style.display = (_authRole === 'admin') ? '' : 'none';
+    }
+}
+
+function toggleAuthUI() {
+    var enabled = document.getElementById('set-auth-enabled').checked;
+    document.getElementById('auth-settings-panel').style.display = enabled ? 'block' : 'none';
+}
+
+function loadUsers() {
+    fetch('/api/users').then(function(r) {
+        if (!r.ok) return [];
+        return r.json();
+    }).then(function(users) {
+        if (!users || !users.length) {
+            document.getElementById('users-tbody').innerHTML =
+                '<tr><td colspan="3" style="padding:12px;color:var(--text-dim);text-align:center;">No users configured. Add a user below to enable authentication.</td></tr>';
+            return;
+        }
+        var html = '';
+        users.forEach(function(u) {
+            var roleBg = u.role === 'admin' ? 'rgba(167,139,250,0.15)' : (u.role === 'operator' ? 'rgba(245,158,11,0.15)' : 'rgba(34,197,94,0.15)');
+            var roleColor = u.role === 'admin' ? '#a78bfa' : (u.role === 'operator' ? '#f59e0b' : '#22c55e');
+            html += '<tr style="border-bottom:1px solid var(--border);">';
+            html += '<td style="padding:8px 12px;color:var(--text);">' + esc(u.username) + '</td>';
+            html += '<td style="padding:8px 12px;"><span style="padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;background:' + roleBg + ';color:' + roleColor + ';">' + esc(u.role) + '</span></td>';
+            html += '<td style="padding:8px 12px;">';
+            html += '<select onchange="updateUserRole(\'' + esc(u.username) + '\', this.value)" style="font-size:12px;padding:2px 6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;margin-right:6px;">';
+            html += '<option value="" disabled selected>Change role</option>';
+            html += '<option value="admin"' + (u.role==='admin'?' disabled':'') + '>Admin</option>';
+            html += '<option value="operator"' + (u.role==='operator'?' disabled':'') + '>Operator</option>';
+            html += '<option value="viewer"' + (u.role==='viewer'?' disabled':'') + '>Viewer</option>';
+            html += '</select>';
+            html += '<button onclick="deleteUser(\'' + esc(u.username) + '\')" style="font-size:12px;padding:2px 8px;background:none;border:1px solid #ff6b6b;color:#ff6b6b;border-radius:4px;cursor:pointer;" title="Delete user">&times;</button>';
+            html += '</td></tr>';
+        });
+        document.getElementById('users-tbody').innerHTML = html;
+    }).catch(function(){});
+}
+
+function addUser() {
+    var username = document.getElementById('new-user-name').value.trim();
+    var password = document.getElementById('new-user-pass').value;
+    var role = document.getElementById('new-user-role').value;
+    var res = document.getElementById('add-user-result');
+    if (!username || !password) {
+        res.textContent = 'Username and password are required.'; res.style.color = '#ff6b6b'; return;
+    }
+    fetch('/api/users', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username: username, password: password, role: role})
+    }).then(function(r) { return r.json().then(function(d){ d._status = r.status; return d; }); })
+    .then(function(d) {
+        if (d._status === 200 || d._status === 201) {
+            res.textContent = 'User "' + username + '" created.'; res.style.color = '#3fb950';
+            document.getElementById('new-user-name').value = '';
+            document.getElementById('new-user-pass').value = '';
+            loadUsers();
+        } else {
+            res.textContent = d.error || 'Failed to create user.'; res.style.color = '#ff6b6b';
+        }
+        setTimeout(function(){ res.textContent = ''; }, 5000);
+    });
+}
+
+function updateUserRole(username, newRole) {
+    if (!newRole) return;
+    fetch('/api/users/' + encodeURIComponent(username), {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({role: newRole})
+    }).then(function(r) { return r.json(); })
+    .then(function() { loadUsers(); });
+}
+
+function deleteUser(username) {
+    if (!confirm('Delete user "' + username + '"?')) return;
+    fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' })
+    .then(function() { loadUsers(); });
+}
+
+function saveAuthSettings() {
+    var data = { auth_enabled: document.getElementById('set-auth-enabled').checked };
+    api('/api/config', { method: 'PUT', body: data }).then(function() {
+        alert('Authentication settings saved.');
+        checkAuth();
+    });
+}
+
+function loadAuthSettings() {
+    fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
+        document.getElementById('set-auth-enabled').checked = !!c.auth_enabled;
+        toggleAuthUI();
+        loadUsers();
+    }).catch(function(){});
+}
+
 function saveSettings() {
   var data = {
     syslog: {
@@ -3281,6 +3547,7 @@ function deleteApiKey(id) {
 }
 
 // ------- Init -------
+checkAuth();
 loadStats();
 startLivePolling();
 
