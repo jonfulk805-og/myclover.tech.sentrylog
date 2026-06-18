@@ -3384,6 +3384,46 @@ def _start_all_security_connectors():
         log.info("[Connector] Started %d security connector(s)", len(rows))
 
 
+def _connector_watchdog_loop():
+    """Watchdog that auto-restarts crashed connector threads every 60s."""
+    while _running:
+        time.sleep(60)
+        if not _running:
+            break
+        try:
+            conn = get_db()
+            rows = conn.execute(
+                "SELECT id, name, connector_type, api_url, api_key, api_secret, "
+                "extra_config, poll_interval_seconds, enabled "
+                "FROM security_connectors WHERE enabled = 1"
+            ).fetchall()
+            conn.close()
+        except Exception:
+            continue
+
+        for row in rows:
+            cid = row[0]
+            # Check if thread is dead or missing
+            thread = _connector_threads.get(cid)
+            if thread is None or not thread.is_alive():
+                connector = {
+                    "id": cid, "name": row[1], "connector_type": row[2],
+                    "api_url": row[3], "api_key": row[4], "api_secret": row[5],
+                    "extra_config": row[6], "poll_interval_seconds": row[7],
+                    "enabled": row[8],
+                }
+                # Clean up stale entries before restarting
+                if cid in _connector_stop:
+                    del _connector_stop[cid]
+                if cid in _connector_threads:
+                    del _connector_threads[cid]
+                start_security_connector(connector)
+                log.info("[Watchdog] Auto-restarted connector %d (%s)",
+                         cid, row[1])
+
+    log.info("[Watchdog] Connector watchdog stopped")
+
+
 # ---------------------------------------------------------------------------
 # Phase 4: Cross-Source Correlation Engine
 # ---------------------------------------------------------------------------
@@ -5138,6 +5178,41 @@ if HAS_FLASK:
             return jsonify({"status": "error",
                             "message": str(exc)[:500]})
 
+    @app.route("/api/security/connectors/<int:cid>/restart", methods=["POST"])
+    @require_tier(TIER_ENT)
+    def api_restart_security_connector(cid):
+        """Stop and restart a security connector's polling thread."""
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id, name, connector_type, api_url, api_key, api_secret, "
+            "extra_config, poll_interval_seconds, enabled "
+            "FROM security_connectors WHERE id = ?", (cid,)
+        ).fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({"status": "error",
+                            "message": "Connector not found."}), 404
+        if not row[8]:
+            return jsonify({"status": "error",
+                            "message": "Connector is disabled. Enable it first."})
+
+        # Stop existing thread
+        stop_security_connector(cid)
+
+        # Restart
+        connector = {
+            "id": row[0], "name": row[1], "connector_type": row[2],
+            "api_url": row[3], "api_key": row[4], "api_secret": row[5],
+            "extra_config": row[6], "poll_interval_seconds": row[7],
+            "enabled": row[8],
+        }
+        start_security_connector(connector)
+        log.info("[Connector] Manually restarted connector %d (%s)",
+                 cid, row[1])
+        return jsonify({"status": "ok",
+                        "message": "Connector restarted."})
+
     @app.route("/api/security/connectors/status")
     @require_tier(TIER_ENT)
     def api_security_connectors_status():
@@ -6376,6 +6451,11 @@ def main():
 
     # Start Security API connectors (Phase 3)
     _start_all_security_connectors()
+
+    # Start connector watchdog (auto-restart crashed threads)
+    watchdog_t = threading.Thread(target=_connector_watchdog_loop, daemon=True)
+    watchdog_t.start()
+    log.info("Connector watchdog started (60s check interval)")
 
     # Start Correlation Engine (Phase 4)
     corr_thread = threading.Thread(target=_correlation_loop, daemon=True)

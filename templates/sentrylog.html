@@ -2415,6 +2415,11 @@ function loadConnectors() {
       html += '<div style="display:flex; gap:6px; align-items:start">';
       html += '<span style="font-size:11px; color:' + statusColor + '; font-weight:600; padding:4px 0">' + statusText + '</span>';
       html += '<button class="btn btn-sm" onclick="testConnector(' + c.id + ')">Test</button>';
+      if (c.enabled && !c.collector_running) {
+        html += '<button class="btn btn-sm" style="color:var(--orange);border-color:var(--orange)" onclick="restartConnector(' + c.id + ')">Restart</button>';
+      } else if (c.enabled && c.collector_running) {
+        html += '<button class="btn btn-sm" onclick="restartConnector(' + c.id + ')">Restart</button>';
+      }
       html += '<button class="btn btn-sm" onclick="editConnector(' + c.id + ')">Edit</button>';
       html += '<button class="btn btn-sm btn-danger" onclick="deleteConnector(' + c.id + ')">Delete</button>';
       html += '</div>';
@@ -2536,6 +2541,16 @@ function testConnector(connId) {
     if (r.status === 'ok') alert('Connection successful!\n\n' + (r.message || ''));
     else alert('Connection failed:\n\n' + (r.message || 'Unknown error'));
   }).catch(function() { alert('Test failed.'); });
+}
+
+function restartConnector(connId) {
+  api('/api/security/connectors/' + connId + '/restart', { method: 'POST' }).then(function(r) {
+    if (r.status === 'ok') {
+      loadConnectorsTab();
+    } else {
+      alert('Restart failed: ' + (r.message || 'Unknown error'));
+    }
+  }).catch(function() { alert('Restart failed.'); });
 }
 
 function openWebhookModal() {
