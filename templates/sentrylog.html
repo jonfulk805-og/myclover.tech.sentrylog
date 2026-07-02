@@ -494,28 +494,6 @@ tr:hover td { background: rgba(34,197,94,0.03); }
 </style>
 </head>
 <body>
-
-<!-- ========== LOGIN OVERLAY ========== -->
-<div id="login-overlay" style="display:none;position:fixed;inset:0;background:var(--bg,#0d1117);z-index:9999;align-items:center;justify-content:center;">
-    <div style="background:var(--card-bg,#161b22);border:1px solid var(--border,#30363d);border-radius:12px;padding:40px;width:360px;max-width:90vw;">
-        <div style="text-align:center;margin-bottom:24px;">
-            <div style="font-size:32px;margin-bottom:8px;">&#x1F6E1;</div>
-            <h1 style="font-size:20px;color:var(--text,#e6edf3);margin:0;">SentryLog</h1>
-            <p style="color:var(--text-dim,#7d8590);font-size:12px;margin-top:4px;">Sign in to continue</p>
-        </div>
-        <div id="login-error" style="display:none;background:#3b1c1c;color:#ff6b6b;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px;"></div>
-        <div style="margin-bottom:14px;">
-            <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim,#7d8590);margin-bottom:6px;">Username</label>
-            <input type="text" id="login-username" style="width:100%;padding:10px 12px;background:var(--bg,#0d1117);border:1px solid var(--border,#30363d);border-radius:6px;color:var(--text,#e6edf3);font-size:14px;" autocomplete="username" onkeydown="if(event.key==='Enter')doLogin()">
-        </div>
-        <div style="margin-bottom:20px;">
-            <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim,#7d8590);margin-bottom:6px;">Password</label>
-            <input type="password" id="login-password" style="width:100%;padding:10px 12px;background:var(--bg,#0d1117);border:1px solid var(--border,#30363d);border-radius:6px;color:var(--text,#e6edf3);font-size:14px;" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
-        </div>
-        <button onclick="doLogin()" id="login-btn" style="width:100%;padding:10px;background:var(--accent,#58a6ff);color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;">Sign In</button>
-    </div>
-</div>
-
 <!-- Navigation -->
 <nav class="nav">
   <div class="nav-brand">
@@ -539,8 +517,6 @@ tr:hover td { background: rgba(34,197,94,0.03); }
     <button class="nav-tab" data-tab="settings">Settings</button>
   </div>
   <div class="nav-right">
-    <span id="auth-user-badge" style="display:none;font-size:12px;color:var(--text-dim);background:var(--card-bg);padding:3px 10px;border-radius:4px;border:1px solid var(--border);margin-right:8px;"></span>
-    <button id="logout-btn" onclick="doLogout()" style="display:none;padding:3px 10px;font-size:12px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:4px;cursor:pointer;margin-right:8px;">Logout</button>
     <span class="tier-badge tier-community" id="tierBadge">COMMUNITY</span>
   </div>
 </nav>
@@ -1113,67 +1089,6 @@ tr:hover td { background: rgba(34,197,94,0.03); }
 
     <div class="card">
       <div class="settings-section">
-        <h3>&#128274; Authentication</h3>
-        <div class="settings-row">
-          <label style="display:flex;align-items:center;gap:8px;">
-            <input type="checkbox" id="set-auth-enabled" style="accent-color:var(--accent);width:16px;height:16px;" onchange="toggleAuthUI()">
-            Enable user authentication (requires login to access dashboard)
-          </label>
-        </div>
-        <div id="auth-settings-panel" style="display:none;margin-top:16px;">
-          <h4 style="color:var(--text);font-size:14px;margin-bottom:12px;">Users</h4>
-          <table id="users-table" style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px;">
-            <thead>
-              <tr style="border-bottom:1px solid var(--border);text-align:left;">
-                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;">Username</th>
-                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;">Role</th>
-                <th style="padding:8px 12px;color:var(--text-dim);font-weight:600;width:140px;">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="users-tbody">
-              <tr><td colspan="3" style="padding:12px;color:var(--text-dim);text-align:center;">No users configured</td></tr>
-            </tbody>
-          </table>
-          <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:16px;">
-            <h4 style="color:var(--text);font-size:13px;margin-bottom:12px;">Add User</h4>
-            <div style="display:grid;grid-template-columns:1fr 1fr 120px auto;gap:10px;align-items:end;">
-              <div>
-                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Username</label>
-                <input type="text" id="new-user-name" placeholder="username" autocomplete="off" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
-              </div>
-              <div>
-                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Password</label>
-                <input type="password" id="new-user-pass" placeholder="password" autocomplete="new-password" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
-              </div>
-              <div>
-                <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:4px;">Role</label>
-                <select id="new-user-role" style="width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;">
-                  <option value="admin">Admin</option>
-                  <option value="operator">Operator</option>
-                  <option value="viewer" selected>Viewer</option>
-                </select>
-              </div>
-              <button class="btn btn-primary" onclick="addUser()" style="height:34px;padding:0 16px;">Add</button>
-            </div>
-            <div id="add-user-result" style="font-size:12px;margin-top:8px;"></div>
-          </div>
-          <div style="margin-top:12px;padding:10px 14px;background:rgba(88,166,255,0.08);border:1px solid rgba(88,166,255,0.2);border-radius:6px;">
-            <div style="font-size:12px;color:var(--text-dim);">
-              <strong style="color:var(--text);">Roles:</strong>
-              <strong>Admin</strong> &mdash; Full access (settings, users, connectors)&nbsp;&nbsp;|&nbsp;&nbsp;
-              <strong>Operator</strong> &mdash; Can acknowledge alerts and manage rules&nbsp;&nbsp;|&nbsp;&nbsp;
-              <strong>Viewer</strong> &mdash; Read-only dashboard access
-            </div>
-          </div>
-        </div>
-        <div style="margin-top:16px">
-          <button class="btn btn-primary" onclick="saveAuthSettings()">Save Authentication Settings</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="settings-section">
         <h3>License</h3>
         <div class="settings-row">
           <label>Current Tier:</label>
@@ -1195,26 +1110,6 @@ tr:hover td { background: rgba(34,197,94,0.03); }
           <button class="btn btn-primary" onclick="activateLicense()">Activate</button>
           <a href="https://myclover.tech/pricing" target="_blank" style="margin-left:12px; font-size:13px">View Pricing</a>
         </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="settings-section">
-        <h3>Backup &amp; Restore</h3>
-        <p style="color:var(--text-dim); font-size:13px; margin-bottom:12px">
-          Back up all configuration: security connectors, alert rules, Windows log targets,
-          correlation rules, notification channels, forwarding targets, API keys, scheduled
-          reports, file targets, and the config YAML. Log data is not included.
-        </p>
-        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:16px">
-          <button class="btn btn-primary" onclick="createBackup()">Create Backup</button>
-          <label class="btn" style="cursor:pointer; margin:0">
-            Restore from File
-            <input type="file" accept=".zip" onchange="restoreFromFile(this)" style="display:none">
-          </label>
-        </div>
-        <div id="backupList" style="margin-top:8px"></div>
-        <div id="backupStatus" style="margin-top:8px; font-size:13px; color:var(--accent)"></div>
       </div>
     </div>
 
@@ -1572,9 +1467,6 @@ tr:hover td { background: rgba(34,197,94,0.03); }
    ============================================================ */
 
 // State
-var _authUser = null;
-var _authRole = null;
-
 let currentTab = 'overview';
 let liveMode = true;
 let liveInterval = null;
@@ -1612,7 +1504,7 @@ function switchTab(tab) {
   if (tab === 'notifications') refreshNotifications();
   if (tab === 'forwarding') refreshForwarding();
   if (tab === 'apikeys') refreshApiKeys();
-  if (tab === 'settings') { loadSettings(); loadAuthSettings(); loadBackups(); }
+  if (tab === 'settings') loadSettings();
 }
 
 // ------- API helpers -------
@@ -1643,7 +1535,7 @@ function loadStats() {
       badge.style.display = 'none';
     }
 
-    renderVolumeChart(d.hourly_volume, d.hourly_volume_by_source);
+    renderVolumeChart(d.hourly_volume);
     renderSeverityChart(d.severity_breakdown);
     renderTopSources(d.top_sources);
     renderRecentAlerts(d.recent_alerts);
@@ -1656,121 +1548,38 @@ function formatNum(n) {
   return String(n);
 }
 
-/* Color palette for per-source stacked bars */
-var SOURCE_COLORS = [
-  {bg: 'rgba(34,197,94,0.55)',  border: '#22c55e'},  /* green  */
-  {bg: 'rgba(59,130,246,0.55)', border: '#3b82f6'},  /* blue   */
-  {bg: 'rgba(249,115,22,0.55)', border: '#f97316'},  /* orange */
-  {bg: 'rgba(168,85,247,0.55)', border: '#a855f7'},  /* purple */
-  {bg: 'rgba(236,72,153,0.55)', border: '#ec4899'},  /* pink   */
-  {bg: 'rgba(234,179,8,0.55)',  border: '#eab308'},  /* yellow */
-  {bg: 'rgba(20,184,166,0.55)', border: '#14b8a6'},  /* teal   */
-  {bg: 'rgba(239,68,68,0.55)',  border: '#ef4444'},  /* red    */
-  {bg: 'rgba(99,102,241,0.55)', border: '#6366f1'},  /* indigo */
-  {bg: 'rgba(16,185,129,0.55)', border: '#10b981'},  /* emerald*/
-  {bg: 'rgba(244,63,94,0.55)',  border: '#f43f5e'},  /* rose   */
-  {bg: 'rgba(245,158,11,0.55)', border: '#f59e0b'},  /* amber  */
-  {bg: 'rgba(6,182,212,0.55)',  border: '#06b6d4'},  /* cyan   */
-  {bg: 'rgba(132,204,22,0.55)', border: '#84cc16'},  /* lime   */
-  {bg: 'rgba(217,70,239,0.55)', border: '#d946ef'},  /* fuchsia*/
-  {bg: 'rgba(156,163,175,0.55)',border: '#9ca3af'},  /* gray   */
-];
-
-function renderVolumeChart(data, bySource) {
+function renderVolumeChart(data) {
   var ctx = document.getElementById('volumeChart').getContext('2d');
-
-  /* Build ordered hour labels from the totals array */
   var labels = data.map(function(d) {
     var parts = d.hour.split(' ');
     return parts.length > 1 ? parts[1].substring(0, 5) : d.hour;
   });
-  var hourKeys = data.map(function(d) { return d.hour; });
-
-  /* Determine datasets */
-  var datasets = [];
-  if (bySource && bySource.length > 0) {
-    /* Discover unique sources, ordered by total volume desc */
-    var srcTotals = {};
-    var srcNames  = {};
-    bySource.forEach(function(r) {
-      var key = r.source_ip;
-      srcTotals[key] = (srcTotals[key] || 0) + r.count;
-      srcNames[key]  = r.source_name || r.source_ip;
-    });
-    var srcKeys = Object.keys(srcTotals).sort(function(a, b) {
-      return srcTotals[b] - srcTotals[a];
-    });
-
-    /* Build a lookup: {source_ip: {hour: count}} */
-    var lookup = {};
-    bySource.forEach(function(r) {
-      if (!lookup[r.source_ip]) lookup[r.source_ip] = {};
-      lookup[r.source_ip][r.hour] = r.count;
-    });
-
-    /* One dataset per source */
-    srcKeys.forEach(function(src, idx) {
-      var color = SOURCE_COLORS[idx % SOURCE_COLORS.length];
-      var label = srcNames[src] !== src
-        ? srcNames[src] + ' (' + src + ')'
-        : src;
-      datasets.push({
-        label: label,
-        data: hourKeys.map(function(h) { return (lookup[src] && lookup[src][h]) || 0; }),
-        backgroundColor: color.bg,
-        borderColor: color.border,
-        borderWidth: 1,
-        borderRadius: 4,
-      });
-    });
-  } else {
-    /* Fallback: single green bar (no per-source data) */
-    datasets.push({
-      label: 'Logs',
-      data: data.map(function(d) { return d.count; }),
-      backgroundColor: 'rgba(34,197,94,0.4)',
-      borderColor: '#22c55e',
-      borderWidth: 1,
-      borderRadius: 4,
-    });
-  }
+  var values = data.map(function(d) { return d.count; });
 
   if (volumeChart) volumeChart.destroy();
   volumeChart = new Chart(ctx, {
     type: 'bar',
-    data: { labels: labels, datasets: datasets },
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Logs',
+        data: values,
+        backgroundColor: 'rgba(34,197,94,0.4)',
+        borderColor: '#22c55e',
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: datasets.length > 1,
-          position: 'bottom',
-          labels: {
-            color: '#94a3b8',
-            boxWidth: 12,
-            padding: 10,
-            font: { size: 10 }
-          }
-        },
-        tooltip: {
-          mode: 'index',
-          callbacks: {
-            footer: function(items) {
-              var sum = items.reduce(function(s, i) { return s + i.parsed.y; }, 0);
-              return 'Total: ' + formatNum(sum);
-            }
-          }
-        }
-      },
+      plugins: { legend: { display: false } },
       scales: {
         x: {
-          stacked: true,
           grid: { color: 'rgba(30,58,95,0.3)' },
           ticks: { color: '#94a3b8', maxTicksLimit: 12, font: { size: 10 } }
         },
         y: {
-          stacked: true,
           grid: { color: 'rgba(30,58,95,0.3)' },
           ticks: { color: '#94a3b8', font: { size: 10 } },
           beginAtZero: true,
@@ -2415,11 +2224,6 @@ function loadConnectors() {
       html += '<div style="display:flex; gap:6px; align-items:start">';
       html += '<span style="font-size:11px; color:' + statusColor + '; font-weight:600; padding:4px 0">' + statusText + '</span>';
       html += '<button class="btn btn-sm" onclick="testConnector(' + c.id + ')">Test</button>';
-      if (c.enabled && !c.collector_running) {
-        html += '<button class="btn btn-sm" style="color:var(--orange);border-color:var(--orange)" onclick="restartConnector(' + c.id + ')">Restart</button>';
-      } else if (c.enabled && c.collector_running) {
-        html += '<button class="btn btn-sm" onclick="restartConnector(' + c.id + ')">Restart</button>';
-      }
       html += '<button class="btn btn-sm" onclick="editConnector(' + c.id + ')">Edit</button>';
       html += '<button class="btn btn-sm btn-danger" onclick="deleteConnector(' + c.id + ')">Delete</button>';
       html += '</div>';
@@ -2541,16 +2345,6 @@ function testConnector(connId) {
     if (r.status === 'ok') alert('Connection successful!\n\n' + (r.message || ''));
     else alert('Connection failed:\n\n' + (r.message || 'Unknown error'));
   }).catch(function() { alert('Test failed.'); });
-}
-
-function restartConnector(connId) {
-  api('/api/security/connectors/' + connId + '/restart', { method: 'POST' }).then(function(r) {
-    if (r.status === 'ok') {
-      loadConnectorsTab();
-    } else {
-      alert('Restart failed: ' + (r.message || 'Unknown error'));
-    }
-  }).catch(function() { alert('Restart failed.'); });
 }
 
 function openWebhookModal() {
@@ -2917,184 +2711,6 @@ function loadSettings() {
   });
 }
 
-// ===== Authentication =====
-function checkAuth() {
-    fetch('/api/auth/me').then(function(r) {
-        if (r.status === 401) { showLoginScreen(); return null; }
-        return r.json();
-    }).then(function(d) {
-        if (!d) return;
-        _authUser = d.username; _authRole = d.role;
-        hideLoginScreen(); applyRoleRestrictions();
-    }).catch(function() {
-        fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
-            if (c.auth_enabled) { showLoginScreen(); }
-            else { _authUser = 'admin'; _authRole = 'admin'; hideLoginScreen(); }
-        });
-    });
-}
-
-function showLoginScreen() {
-    var ov = document.getElementById('login-overlay');
-    ov.style.display = 'flex';
-    setTimeout(function(){ document.getElementById('login-username').focus(); }, 100);
-}
-
-function hideLoginScreen() {
-    document.getElementById('login-overlay').style.display = 'none';
-    if (_authUser && _authUser !== 'admin') {
-        document.getElementById('auth-user-badge').textContent = _authUser + ' (' + _authRole + ')';
-        document.getElementById('auth-user-badge').style.display = 'inline';
-        document.getElementById('logout-btn').style.display = 'inline';
-    } else {
-        fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
-            if (c.auth_enabled && _authUser) {
-                document.getElementById('auth-user-badge').textContent = _authUser + ' (' + _authRole + ')';
-                document.getElementById('auth-user-badge').style.display = 'inline';
-                document.getElementById('logout-btn').style.display = 'inline';
-            }
-        }).catch(function(){});
-    }
-}
-
-function doLogin() {
-    var username = document.getElementById('login-username').value.trim();
-    var password = document.getElementById('login-password').value;
-    var errEl = document.getElementById('login-error');
-    var btn = document.getElementById('login-btn');
-    if (!username || !password) {
-        errEl.textContent = 'Please enter username and password.'; errEl.style.display = 'block'; return;
-    }
-    btn.disabled = true; btn.textContent = 'Signing in...';
-    fetch('/api/auth/login', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({username: username, password: password})
-    }).then(function(r) {
-        return r.json().then(function(d) { d._status = r.status; return d; });
-    }).then(function(d) {
-        btn.disabled = false; btn.textContent = 'Sign In';
-        if (d._status === 200) {
-            _authUser = d.username; _authRole = d.role;
-            errEl.style.display = 'none';
-            document.getElementById('login-password').value = '';
-            hideLoginScreen(); applyRoleRestrictions();
-        } else {
-            errEl.textContent = d.error || 'Invalid credentials.'; errEl.style.display = 'block';
-        }
-    }).catch(function(e) {
-        btn.disabled = false; btn.textContent = 'Sign In';
-        errEl.textContent = 'Connection error: ' + e.message; errEl.style.display = 'block';
-    });
-}
-
-function doLogout() {
-    fetch('/api/auth/logout', { method: 'POST' }).then(function() {
-        _authUser = null; _authRole = null;
-        document.getElementById('auth-user-badge').style.display = 'none';
-        document.getElementById('logout-btn').style.display = 'none';
-        checkAuth();
-    });
-}
-
-function applyRoleRestrictions() {
-    var adminEls = document.querySelectorAll('[data-auth-role="admin"]');
-    for (var i = 0; i < adminEls.length; i++) {
-        adminEls[i].style.display = (_authRole === 'admin') ? '' : 'none';
-    }
-}
-
-function toggleAuthUI() {
-    var enabled = document.getElementById('set-auth-enabled').checked;
-    document.getElementById('auth-settings-panel').style.display = enabled ? 'block' : 'none';
-}
-
-function loadUsers() {
-    fetch('/api/users').then(function(r) {
-        if (!r.ok) return [];
-        return r.json();
-    }).then(function(users) {
-        if (!users || !users.length) {
-            document.getElementById('users-tbody').innerHTML =
-                '<tr><td colspan="3" style="padding:12px;color:var(--text-dim);text-align:center;">No users configured. Add a user below to enable authentication.</td></tr>';
-            return;
-        }
-        var html = '';
-        users.forEach(function(u) {
-            var roleBg = u.role === 'admin' ? 'rgba(167,139,250,0.15)' : (u.role === 'operator' ? 'rgba(245,158,11,0.15)' : 'rgba(34,197,94,0.15)');
-            var roleColor = u.role === 'admin' ? '#a78bfa' : (u.role === 'operator' ? '#f59e0b' : '#22c55e');
-            html += '<tr style="border-bottom:1px solid var(--border);">';
-            html += '<td style="padding:8px 12px;color:var(--text);">' + esc(u.username) + '</td>';
-            html += '<td style="padding:8px 12px;"><span style="padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;background:' + roleBg + ';color:' + roleColor + ';">' + esc(u.role) + '</span></td>';
-            html += '<td style="padding:8px 12px;">';
-            html += '<select onchange="updateUserRole(\'' + esc(u.username) + '\', this.value)" style="font-size:12px;padding:2px 6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;margin-right:6px;">';
-            html += '<option value="" disabled selected>Change role</option>';
-            html += '<option value="admin"' + (u.role==='admin'?' disabled':'') + '>Admin</option>';
-            html += '<option value="operator"' + (u.role==='operator'?' disabled':'') + '>Operator</option>';
-            html += '<option value="viewer"' + (u.role==='viewer'?' disabled':'') + '>Viewer</option>';
-            html += '</select>';
-            html += '<button onclick="deleteUser(\'' + esc(u.username) + '\')" style="font-size:12px;padding:2px 8px;background:none;border:1px solid #ff6b6b;color:#ff6b6b;border-radius:4px;cursor:pointer;" title="Delete user">&times;</button>';
-            html += '</td></tr>';
-        });
-        document.getElementById('users-tbody').innerHTML = html;
-    }).catch(function(){});
-}
-
-function addUser() {
-    var username = document.getElementById('new-user-name').value.trim();
-    var password = document.getElementById('new-user-pass').value;
-    var role = document.getElementById('new-user-role').value;
-    var res = document.getElementById('add-user-result');
-    if (!username || !password) {
-        res.textContent = 'Username and password are required.'; res.style.color = '#ff6b6b'; return;
-    }
-    fetch('/api/users', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({username: username, password: password, role: role})
-    }).then(function(r) { return r.json().then(function(d){ d._status = r.status; return d; }); })
-    .then(function(d) {
-        if (d._status === 200 || d._status === 201) {
-            res.textContent = 'User "' + username + '" created.'; res.style.color = '#3fb950';
-            document.getElementById('new-user-name').value = '';
-            document.getElementById('new-user-pass').value = '';
-            loadUsers();
-        } else {
-            res.textContent = d.error || 'Failed to create user.'; res.style.color = '#ff6b6b';
-        }
-        setTimeout(function(){ res.textContent = ''; }, 5000);
-    });
-}
-
-function updateUserRole(username, newRole) {
-    if (!newRole) return;
-    fetch('/api/users/' + encodeURIComponent(username), {
-        method: 'PUT', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({role: newRole})
-    }).then(function(r) { return r.json(); })
-    .then(function() { loadUsers(); });
-}
-
-function deleteUser(username) {
-    if (!confirm('Delete user "' + username + '"?')) return;
-    fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' })
-    .then(function() { loadUsers(); });
-}
-
-function saveAuthSettings() {
-    var data = { auth_enabled: document.getElementById('set-auth-enabled').checked };
-    api('/api/config', { method: 'PUT', body: data }).then(function() {
-        alert('Authentication settings saved.');
-        checkAuth();
-    });
-}
-
-function loadAuthSettings() {
-    fetch('/api/config').then(function(r){ return r.json(); }).then(function(c) {
-        document.getElementById('set-auth-enabled').checked = !!c.auth_enabled;
-        toggleAuthUI();
-        loadUsers();
-    }).catch(function(){});
-}
-
 function saveSettings() {
   var data = {
     syslog: {
@@ -3134,132 +2750,6 @@ function updateTierDisplay(tier) {
     b.textContent = tier.toUpperCase();
     b.className = 'tier-badge tier-' + tier;
   });
-}
-
-// ------- Backup & Restore -------
-function loadBackups() {
-  api('/api/backup/list').then(function(d) {
-    var el = document.getElementById('backupList');
-    if (!d.backups || d.backups.length === 0) {
-      el.innerHTML = '<span style="color:var(--text-dim); font-size:13px">No backups yet.</span>';
-      return;
-    }
-    var html = '<table style="width:100%; font-size:13px">';
-    html += '<tr style="color:var(--text-dim)"><th style="text-align:left;padding:4px 8px">Date</th>';
-    html += '<th style="text-align:left;padding:4px 8px">Version</th>';
-    html += '<th style="text-align:left;padding:4px 8px">Note</th>';
-    html += '<th style="text-align:right;padding:4px 8px">Size</th>';
-    html += '<th style="text-align:right;padding:4px 8px">Actions</th></tr>';
-    d.backups.forEach(function(b) {
-      var dt = b.created_at ? new Date(b.created_at).toLocaleString() : b.filename;
-      var sz = b.size_bytes > 1048576 ? (b.size_bytes / 1048576).toFixed(1) + ' MB'
-             : (b.size_bytes / 1024).toFixed(1) + ' KB';
-      html += '<tr>';
-      html += '<td style="padding:4px 8px">' + dt + '</td>';
-      html += '<td style="padding:4px 8px">' + (b.version || '--') + '</td>';
-      html += '<td style="padding:4px 8px">' + (b.note || '--') + '</td>';
-      html += '<td style="padding:4px 8px;text-align:right">' + sz + '</td>';
-      html += '<td style="padding:4px 8px;text-align:right">';
-      html += '<a href="/api/backup/download/' + encodeURIComponent(b.filename) + '" style="margin-right:8px" title="Download">Download</a>';
-      html += '<a href="#" onclick="restoreBackup(\'' + b.filename + '\');return false" style="margin-right:8px" title="Restore">Restore</a>';
-      html += '<a href="#" onclick="deleteBackup(\'' + b.filename + '\');return false" style="color:var(--sev-error)" title="Delete">Delete</a>';
-      html += '</td></tr>';
-    });
-    html += '</table>';
-    el.innerHTML = html;
-  });
-}
-
-function createBackup() {
-  var note = prompt('Optional note for this backup:', '');
-  if (note === null) return;
-  var st = document.getElementById('backupStatus');
-  st.textContent = 'Creating backup...';
-  st.style.color = 'var(--accent)';
-  api('/api/backup/create', { method: 'POST', body: { note: note } }).then(function(d) {
-    if (d.error) {
-      st.textContent = 'Error: ' + d.message;
-      st.style.color = 'var(--sev-error)';
-      return;
-    }
-    st.textContent = 'Backup created: ' + d.filename;
-    st.style.color = 'var(--accent)';
-    loadBackups();
-  });
-}
-
-function restoreFromFile(input) {
-  if (!input.files || !input.files[0]) return;
-  if (!confirm('Restore from uploaded backup? This will overwrite current configuration. SentryLog may need a restart for some settings to take effect.')) {
-    input.value = '';
-    return;
-  }
-  var fd = new FormData();
-  fd.append('file', input.files[0]);
-  fd.append('restore_config', 'true');
-  fd.append('restore_tables', 'true');
-  var st = document.getElementById('backupStatus');
-  st.textContent = 'Restoring...';
-  st.style.color = 'var(--accent)';
-  fetch('/api/backup/restore', { method: 'POST', body: fd })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) {
-        st.textContent = 'Restore error: ' + d.message;
-        st.style.color = 'var(--sev-error)';
-        return;
-      }
-      var msg = 'Restore complete.';
-      if (d.summary.config_restored) msg += ' Config restored.';
-      if (d.summary.tables_restored.length) msg += ' Tables: ' + d.summary.tables_restored.join(', ') + '.';
-      if (d.summary.errors.length) msg += ' Errors: ' + d.summary.errors.join('; ');
-      st.textContent = msg;
-      st.style.color = d.summary.errors.length ? 'var(--sev-warning)' : 'var(--accent)';
-      loadSettings();
-      alert('Restore complete. Restart SentryLog to apply all changes (port/listener settings).');
-    });
-  input.value = '';
-}
-
-function restoreBackup(filename) {
-  if (!confirm('Restore from this backup? This will overwrite current configuration.')) return;
-  var fd = new FormData();
-  fd.append('filename', filename);
-  fd.append('restore_config', 'true');
-  fd.append('restore_tables', 'true');
-  var st = document.getElementById('backupStatus');
-  st.textContent = 'Restoring...';
-  st.style.color = 'var(--accent)';
-  fetch('/api/backup/restore', { method: 'POST', body: fd })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) {
-        st.textContent = 'Restore error: ' + d.message;
-        st.style.color = 'var(--sev-error)';
-        return;
-      }
-      var msg = 'Restore complete.';
-      if (d.summary.config_restored) msg += ' Config restored.';
-      if (d.summary.tables_restored.length) msg += ' Tables: ' + d.summary.tables_restored.join(', ') + '.';
-      if (d.summary.errors.length) msg += ' Errors: ' + d.summary.errors.join('; ');
-      st.textContent = msg;
-      st.style.color = d.summary.errors.length ? 'var(--sev-warning)' : 'var(--accent)';
-      loadSettings();
-      alert('Restore complete. Restart SentryLog to apply all changes.');
-    });
-}
-
-function deleteBackup(filename) {
-  if (!confirm('Delete this backup permanently?')) return;
-  fetch('/api/backup/' + encodeURIComponent(filename), { method: 'DELETE' })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) {
-        alert('Error: ' + d.message);
-        return;
-      }
-      loadBackups();
-    });
 }
 
 // ------- Test Log -------
@@ -3383,26 +2873,26 @@ function createNotifChannel() {
   } else {
     cfg = { url: document.getElementById('notifWebhookUrl').value };
   }
-  api('/api/notifications/channels', 'POST', {
+  api('/api/notifications/channels', { method: 'POST', body: {
     name: document.getElementById('notifName').value || 'Untitled',
     channel_type: t,
     config: cfg
-  }).then(function() {
+  }}).then(function() {
     document.getElementById('addNotifForm').style.display = 'none';
     refreshNotifications();
   });
 }
 function testNotifChannel(id) {
-  api('/api/notifications/channels/' + id + '/test', 'POST', {}).then(function(d) {
+  api('/api/notifications/channels/' + id + '/test', { method: 'POST' }).then(function(d) {
     alert(d.status === 'ok' ? 'Test sent successfully!' : 'Error: ' + (d.message||'unknown'));
   });
 }
 function toggleNotifEnabled(id, enabled) {
-  api('/api/notifications/channels/' + id, 'PUT', {enabled: enabled}).then(function() { refreshNotifications(); });
+  api('/api/notifications/channels/' + id, { method: 'PUT', body: {enabled: enabled} }).then(function() { refreshNotifications(); });
 }
 function deleteNotifChannel(id) {
   if (!confirm('Delete this notification channel?')) return;
-  api('/api/notifications/channels/' + id, 'DELETE').then(function() { refreshNotifications(); });
+  api('/api/notifications/channels/' + id, { method: 'DELETE' }).then(function() { refreshNotifications(); });
 }
 
 // ============= Phase 6: File Targets =============
@@ -3562,7 +3052,6 @@ function deleteApiKey(id) {
 }
 
 // ------- Init -------
-checkAuth();
 loadStats();
 startLivePolling();
 
