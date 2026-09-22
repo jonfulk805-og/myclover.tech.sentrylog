@@ -49,6 +49,10 @@ import secrets
 import functools
 import base64
 import queue as queue_mod
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -417,6 +421,9 @@ def _default_config():
         "netmon_integration": {
             "enabled": False,
             "netmon_url": "http://localhost:8080",
+            "read_token": "",
+            "timeout_seconds": 5,
+            "verify_tls": True,
         },
         "notifications": {
             "email_enabled": False,
@@ -5114,6 +5121,205 @@ def redact_config(cfg):
     return cfg
 
 
+# --- Shared incident timeline --------------------------------------------
+# NetMon knows when a device changed state; SentryLog knows what the device was
+# saying at the time. Neither answers "what happened" on its own, so the
+# timeline interleaves both on one clock.
+
+_TIMELINE_MAX_EVENTS = 2000
+_TIMELINE_DEFAULT_HOURS = 6
+
+
+def _as_bool_cfg(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _netmon_settings():
+    with _config_lock:
+        return dict(_config.get("netmon_integration", {}) or {})
+
+
+def fetch_netmon_events(start=None, end=None, device=None, limit=500,
+                        settings=None):
+    """Read device events from NetMon. Returns (events, error_message).
+
+    Never raises: NetMon being down or misconfigured must degrade the timeline
+    to logs-only rather than break the page. The error is returned so the UI can
+    say so out loud instead of implying the devices were quiet.
+    """
+    cfg = settings if settings is not None else _netmon_settings()
+    if not _as_bool_cfg(cfg.get("enabled", False)):
+        return [], "netmon_integration is disabled"
+    base = str(cfg.get("netmon_url", "") or "").rstrip("/")
+    if not base:
+        return [], "netmon_url is not configured"
+
+    params = {"limit": int(limit)}
+    if start:
+        params["from"] = start
+    if end:
+        params["to"] = end
+    if device:
+        params["device"] = device
+    url = base + "/api/integration/events?" + urllib.parse.urlencode(params)
+
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    token = str(cfg.get("read_token", "") or "")
+    if token:
+        req.add_header("X-Netmon-Integration-Token", token)
+    try:
+        timeout = float(cfg.get("timeout_seconds", 5) or 5)
+    except (TypeError, ValueError):
+        timeout = 5.0
+
+    kwargs = {"timeout": timeout}
+    if url.lower().startswith("https://") and not _as_bool_cfg(
+            cfg.get("verify_tls", True)):
+        # Opt-in only, for an internal NetMon with a self-signed certificate.
+        kwargs["context"] = ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(req, **kwargs) as resp:
+            payload = json_mod.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return [], ("NetMon refused the integration token (HTTP %d) -- "
+                        "check integration.read_token on both sides" % exc.code)
+        return [], "NetMon returned HTTP %d" % exc.code
+    except Exception as exc:
+        return [], "NetMon unreachable: %s" % exc
+
+    if not isinstance(payload, dict):
+        return [], "NetMon returned an unexpected payload"
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return [], "NetMon returned no event list"
+    return events, ""
+
+
+def build_timeline(hours=_TIMELINE_DEFAULT_HOURS, device=None, host=None,
+                   start=None, end=None, limit=_TIMELINE_MAX_EVENTS,
+                   severity=None):
+    """Interleave NetMon device events and SentryLog messages on one clock.
+
+    device filters the NetMon side by name; host filters the log side by source.
+    If only a device is given, its hosts are learned from the returned events, so
+    the caller does not have to know the device's IP address.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _TIMELINE_MAX_EVENTS
+    limit = max(1, min(limit, _TIMELINE_MAX_EVENTS))
+
+    now = datetime.datetime.now()
+    if not end:
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+    if not start:
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            hours = _TIMELINE_DEFAULT_HOURS
+        hours = max(0.1, min(hours, 24 * 31))
+        start = (now - datetime.timedelta(hours=hours)
+                 ).strftime("%Y-%m-%d %H:%M:%S")
+
+    events, netmon_error = fetch_netmon_events(
+        start=start, end=end, device=device, limit=limit)
+
+    hosts = set()
+    if host:
+        hosts.add(str(host))
+    for ev in events:
+        if isinstance(ev, dict) and ev.get("host"):
+            hosts.add(str(ev["host"]))
+
+    items = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        items.append({
+            "kind": "device",
+            "timestamp": ev.get("timestamp", ""),
+            "device": ev.get("device", ""),
+            "host": ev.get("host", ""),
+            "status": ev.get("status", ""),
+            "previous_status": ev.get("previous_status", ""),
+            "label": ev.get("check_label") or ev.get("check_type") or "",
+            "event_type": ev.get("type", "state_change"),
+            "message": ev.get("message", ""),
+        })
+
+    where = ["received_at >= ?", "received_at <= ?"]
+    params = [start, end]
+    if hosts:
+        ors = " OR ".join(["source_ip = ? OR source_name = ?"] * len(hosts))
+        where.append("(%s)" % ors)
+        for h in sorted(hosts):
+            params.extend([h, h])
+    elif device:
+        # A device was asked for but no host is known for it. Matching nothing is
+        # correct here: matching everything would quietly fill an incident
+        # timeline with logs from unrelated hosts.
+        where.append("(source_ip = ? OR source_name = ?)")
+        params.extend([device, device])
+    if severity:
+        sevs = [x.strip().lower() for x in str(severity).split(",") if x.strip()]
+        if sevs:
+            where.append("severity IN (%s)" % ",".join(["?"] * len(sevs)))
+            params.extend(sevs)
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT received_at, timestamp, source_ip, source_name, severity,"
+            " facility, app_name, message FROM logs WHERE %s"
+            # limit + 1 so truncation can be reported honestly: the UI needs to
+            # know it is looking at a window, not the whole story.
+            " ORDER BY received_at DESC, id DESC LIMIT ?"
+            % " AND ".join(where), params + [limit + 1]).fetchall()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    for row in rows:
+        items.append({
+            "kind": "log",
+            "timestamp": row["received_at"],
+            "device": row["source_name"] or row["source_ip"] or "",
+            "host": row["source_ip"] or "",
+            "status": row["severity"] or "",
+            "previous_status": "",
+            "label": row["app_name"] or row["facility"] or "",
+            "event_type": "log",
+            "message": row["message"] or "",
+        })
+
+    items.sort(key=lambda i: i["timestamp"])
+    truncated = len(items) > limit
+    if truncated:
+        # Newest wins: an incident is read backwards from the symptom.
+        items = items[-limit:]
+
+    return {
+        "from": start,
+        "to": end,
+        "device": device or "",
+        "hosts": sorted(hosts),
+        "items": items,
+        "count": len(items),
+        "truncated": truncated,
+        "device_events": sum(1 for i in items if i["kind"] == "device"),
+        "log_events": sum(1 for i in items if i["kind"] == "log"),
+        "netmon_error": netmon_error,
+    }
+
+
 if HAS_FLASK:
     app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 
@@ -5177,6 +5383,18 @@ if HAS_FLASK:
         free = free_disk_mb()
         health["free_disk_mb"] = None if free is None else round(free, 1)
         return jsonify(health)
+
+    @app.route("/api/timeline")
+    def api_timeline():
+        """Device events and logs interleaved for one incident window."""
+        return jsonify(build_timeline(
+            hours=request.args.get("hours", _TIMELINE_DEFAULT_HOURS),
+            device=request.args.get("device") or None,
+            host=request.args.get("host") or None,
+            start=request.args.get("from") or None,
+            end=request.args.get("to") or None,
+            severity=request.args.get("severity") or None,
+            limit=request.args.get("limit", _TIMELINE_MAX_EVENTS)))
 
     @app.route("/api/stats")
     def api_stats():
