@@ -152,7 +152,13 @@ to know them.
 
 **`GET /api/timeline`** — `hours` (or `from`/`to`), `device`, `host`, `severity`,
 `limit`. Returns `items` sorted oldest first, each tagged `kind: device | log`,
-plus `device_events`, `log_events`, `truncated`, and `netmon_error`.
+plus `device_events`, `log_events`, `truncated` (set if *either* side hit a limit),
+`netmon_truncated`, and `netmon_error`.
+
+Times: SentryLog stores logs in server-local time and NetMon speaks UTC, so the
+timeline sorts on real instants, never on strings. Each item carries `timestamp`
+(UTC, `Z`) and `local_time` (server-local, what the tab shows). `from`/`to`
+without an offset mean server-local time; `host` restricts both sides.
 
 Two deliberate behaviours:
 

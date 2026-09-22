@@ -1699,6 +1699,10 @@ function loadTimeline() {
   body.innerHTML = '<div style="color:var(--text-dim)">Building timeline&hellip;</div>';
 
   api('/api/timeline?' + params).then(function(d) {
+    if (d.error) {
+      body.innerHTML = '<div style="color:var(--red)">' + tlEscape(d.error) + '</div>';
+      return;
+    }
     document.getElementById('tlStatDevice').textContent = d.device_events || 0;
     document.getElementById('tlStatLogs').textContent = d.log_events || 0;
     document.getElementById('tlStatWindow').textContent = (d.from || '') + ' \u2192 ' + (d.to || '');
@@ -1708,7 +1712,8 @@ function loadTimeline() {
     // Say it out loud when the device half is missing: a timeline that looks
     // quiet because NetMon is unreachable is worse than an error.
     if (d.netmon_error) notes.push('NetMon: ' + d.netmon_error + ' (device events are missing, not absent)');
-    if (d.truncated) notes.push('window truncated \u2014 narrow the time range to see everything');
+    if (d.netmon_truncated) notes.push('NetMon hit its event limit \u2014 older device events in this window are missing');
+    else if (d.truncated) notes.push('window truncated \u2014 narrow the time range to see everything');
     if (notes.length) { warn.style.display = ''; warn.textContent = notes.join(' \u00b7 '); }
     else { warn.style.display = 'none'; warn.textContent = ''; }
 
@@ -1729,7 +1734,7 @@ function loadTimeline() {
         : tlEscape(it.status);
       html += '<div style="display:flex; gap:12px; padding:8px 4px; border-left:3px solid ' + colour
         + '; border-bottom:1px solid var(--border); background:' + (isDevice ? 'rgba(255,255,255,0.02)' : 'transparent') + '">'
-        + '<div style="min-width:150px; color:var(--text-dim); font-family:monospace">' + tlEscape(it.timestamp) + '</div>'
+        + '<div style="min-width:150px; color:var(--text-dim); font-family:monospace">' + '<span title="' + tlEscape(it.timestamp) + '">' + tlEscape(it.local_time || it.timestamp) + '</span></div>'
         + '<div style="min-width:74px; font-weight:600; color:' + colour + '">' + (isDevice ? 'DEVICE' : 'LOG') + '</div>'
         + '<div style="min-width:150px">' + tlEscape(it.device || it.host) + '</div>'
         + '<div style="min-width:110px; color:' + colour + '">' + label + '</div>'

@@ -31,16 +31,26 @@ def _insert_log(sentrylog, source_ip, message, minutes_ago,
 
 def _netmon_event(minutes_ago, device="router", host="10.0.0.5",
                   status="critical", previous="ok", ev_type="state_change"):
-    ts = (datetime.datetime.now() - datetime.timedelta(minutes=minutes_ago)
-          ).strftime("%Y-%m-%d %H:%M:%S")
+    # NetMon's real wire format: timezone-aware UTC with a Z.
+    ts = (datetime.datetime.now(datetime.timezone.utc)
+          - datetime.timedelta(minutes=minutes_ago)
+          ).replace(tzinfo=None).isoformat() + "Z"
     return {"type": ev_type, "timestamp": ts, "device": device, "host": host,
             "check_type": "ping", "check_label": "ping", "status": status,
             "previous_status": previous, "message": "went " + status}
 
 
-def _fake_netmon(monkeypatch, sentrylog, events, error=""):
-    monkeypatch.setattr(sentrylog, "fetch_netmon_events",
-                        lambda **kw: (events, error))
+def _fake_netmon(monkeypatch, sentrylog, events, error="", truncated=False,
+                 device_hosts=None):
+    calls = []
+
+    def fake(**kw):
+        calls.append(kw)
+        return {"events": list(events), "error": error, "truncated": truncated,
+                "device_hosts": dict(device_hosts or {})}
+
+    monkeypatch.setattr(sentrylog, "fetch_netmon_feed", fake)
+    return calls
 
 
 def _enable_integration(sentrylog, **overrides):
@@ -73,6 +83,7 @@ def test_device_events_and_logs_are_interleaved_chronologically(
     assert result["log_events"] == 2
     assert result["items"] == sorted(result["items"],
                                      key=lambda i: i["timestamp"])
+    assert all(i["timestamp"].endswith("Z") for i in result["items"])
 
 
 def test_logs_are_matched_to_the_device_by_host_learned_from_netmon(
@@ -239,11 +250,13 @@ def test_request_carries_the_token_and_the_window(sentrylog, monkeypatch):
         return _Resp()
 
     monkeypatch.setattr(sentrylog.urllib.request, "urlopen", capture)
-    sentrylog.fetch_netmon_events(start="2026-01-01 00:00:00",
-                                  end="2026-01-01 06:00:00", device="router")
+    sentrylog.fetch_netmon_events(start="2026-01-01T00:00:00Z",
+                                  end="2026-01-01T06:00:00Z", device="router")
 
     assert seen["token"] == "secret-token"
-    assert "from=2026-01-01" in seen["url"] and "device=router" in seen["url"]
+    assert "from=2026-01-01T00%3A00%3A00Z" in seen["url"]
+    assert "to=2026-01-01T06%3A00%3A00Z" in seen["url"]
+    assert "device=router" in seen["url"]
     assert seen["timeout"] == 1
 
 
@@ -272,3 +285,116 @@ def test_timeline_endpoint_requires_auth_when_auth_is_enabled(sentrylog,
             "username": "admin", "role": "admin",
             "password_hash": sentrylog.hash_password("pw")}]
     assert client.get("/api/timeline").status_code in (401, 403)
+
+
+# --------------------------------------------------------------------------
+# Review round 1 regressions (Codex, 2026-09-22)
+# --------------------------------------------------------------------------
+
+def test_mixed_zone_items_sort_by_instant_not_string(sentrylog, monkeypatch):
+    """P1: a UTC 'T' device event must not sort after a newer local log."""
+    _insert_log(sentrylog, "10.0.0.5", "newer log", 5)
+    _fake_netmon(monkeypatch, sentrylog, [_netmon_event(30)])
+    result = sentrylog.build_timeline(hours=2, device="router")
+    assert [i["kind"] for i in result["items"]] == ["device", "log"]
+
+
+def test_netmon_is_sent_utc_bounds_for_a_local_window(sentrylog, monkeypatch):
+    """P1: SentryLog's local window must reach NetMon as the same instants."""
+    calls = _fake_netmon(monkeypatch, sentrylog, [])
+    sentrylog.build_timeline(start="2026-01-01T10:00:00-07:00",
+                             end="2026-01-01T12:00:00-07:00")
+    feed_start = calls[0]["start"]
+    assert feed_start.astimezone(datetime.timezone.utc).hour == 17
+    assert sentrylog._utc_wire(feed_start) == "2026-01-01T17:00:00Z"
+
+
+def test_explicit_host_restricts_rather_than_unions(sentrylog, monkeypatch):
+    """P2: host=.5 must not pull in .9 just because NetMon returned it."""
+    _insert_log(sentrylog, "10.0.0.5", "mine", 20)
+    _insert_log(sentrylog, "10.0.0.9", "not mine", 20)
+    calls = _fake_netmon(monkeypatch, sentrylog, [
+        _netmon_event(21, device="router", host="10.0.0.5"),
+        _netmon_event(21, device="nas", host="10.0.0.9"),
+    ])
+    result = sentrylog.build_timeline(hours=2, host="10.0.0.5")
+    assert result["hosts"] == ["10.0.0.5"]
+    assert {i["host"] for i in result["items"]} == {"10.0.0.5"}
+    assert result["device_events"] == 1 and result["log_events"] == 1
+    assert calls[0]["host"] == "10.0.0.5", "host was not sent upstream"
+
+
+def test_steady_device_keeps_its_logs(sentrylog, monkeypatch):
+    """P2: no transitions (healthy device) must not mean no logs."""
+    _insert_log(sentrylog, "10.0.0.5", "sshd accepted", 10)
+    _insert_log(sentrylog, "10.0.0.9", "unrelated", 10)
+    _fake_netmon(monkeypatch, sentrylog, [],
+                 device_hosts={"router": "10.0.0.5"})
+    result = sentrylog.build_timeline(hours=2, device="router")
+    assert [i["message"] for i in result["items"]] == ["sshd accepted"]
+
+
+def test_upstream_truncation_is_propagated(sentrylog, monkeypatch):
+    """P2: NetMon's truncated flag must reach the UI warning."""
+    _fake_netmon(monkeypatch, sentrylog,
+                 [_netmon_event(20), _netmon_event(10, status="ok",
+                                                   previous="critical")],
+                 truncated=True, device_hosts={"router": "10.0.0.5"})
+    result = sentrylog.build_timeline(hours=2, device="router", limit=2)
+    assert result["truncated"] is True
+    assert result["netmon_truncated"] is True
+
+
+def test_bad_window_is_a_400(sentrylog, client, monkeypatch):
+    _fake_netmon(monkeypatch, sentrylog, [])
+    assert client.get("/api/timeline?from=last-tuesday").status_code == 400
+
+
+def test_real_http_transport_round_trip(sentrylog, monkeypatch):
+    """The actual urllib client against a local HTTP server, no mocked transport.
+
+    The stub speaks NetMon's contract: UTC 'Z' timestamps, device_hosts, and a
+    truncated flag. It also records what SentryLog asked for.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    seen = {}
+    ev = _netmon_event(15, device="router", host="10.0.0.5")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["query"] = parse_qs(urlparse(self.path).query)
+            seen["token"] = self.headers.get("X-Netmon-Integration-Token")
+            body = json.dumps({"events": [ev], "truncated": False,
+                               "device_hosts": {"router": "10.0.0.5"}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _enable_integration(sentrylog, netmon_url="http://127.0.0.1:%d"
+                            % server.server_address[1], read_token="t0k")
+        _insert_log(sentrylog, "10.0.0.5", "before the outage", 16)
+        _insert_log(sentrylog, "10.0.0.5", "after the outage", 14)
+        result = sentrylog.build_timeline(hours=1, device="router")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["netmon_error"] == ""
+    assert seen["token"] == "t0k"
+    assert seen["query"]["from"][0].endswith("Z")
+    assert seen["query"]["to"][0].endswith("Z")
+    assert [i["message"] for i in result["items"]] == [
+        "before the outage", "went critical", "after the outage"]
