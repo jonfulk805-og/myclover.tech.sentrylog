@@ -6,9 +6,9 @@
 # IMPORTANT: For syslog to show real device source IPs instead of the Docker
 # gateway IP (e.g. 172.x.x.1), use network_mode: host (see below).
 #
-# Mount your own sentrylog_config.yaml to customize settings:
+# Mount your own config to customize settings (note the /app/data path):
 #   volumes:
-#     - ./my-config.yaml:/app/sentrylog_config.yaml
+#     - ./my-config.yaml:/app/data/sentrylog_config.yaml
 
 services:
   sentrylog:
@@ -37,8 +37,10 @@ services:
 
     volumes:
       - sentrylog-data:/app/data
-      # Uncomment to use your own config:
-      # - ./sentrylog_config.yaml:/app/sentrylog_config.yaml
+      # The config now lives inside the data volume
+      # (/app/data/sentrylog_config.yaml) so dashboard edits survive a
+      # container replacement. To supply your own, mount it there:
+      # - ./sentrylog_config.yaml:/app/data/sentrylog_config.yaml
     environment:
       - TZ=America/Los_Angeles
     healthcheck:
