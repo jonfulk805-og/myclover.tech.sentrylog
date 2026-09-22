@@ -36,8 +36,12 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Default environment
-ENV SENTRYLOG_CONFIG=/app/sentrylog_config.yaml
+ENV SENTRYLOG_DATA_DIR=/app/data
+ENV SENTRYLOG_CONFIG=/app/data/sentrylog_config.yaml
 ENV SENTRYLOG_DB_PATH=/app/data/sentrylog.db
+ENV SENTRYLOG_BACKUP_DIR=/app/data/backups
+ENV SENTRYLOG_SPOOL_DIR=/app/data/spool
+ENV SENTRYLOG_SECRET_FILE=/app/data/auth_secret.key
 
 # Dashboard port
 EXPOSE 8514
