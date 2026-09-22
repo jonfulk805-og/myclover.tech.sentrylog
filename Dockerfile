@@ -35,9 +35,11 @@ RUN mkdir -p /app/data
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-# Default environment
-ENV SENTRYLOG_CONFIG=/app/sentrylog_config.yaml
+# Default environment -- everything mutable lives on the /app/data volume
+ENV SENTRYLOG_DATA_DIR=/app/data
+ENV SENTRYLOG_CONFIG=/app/data/sentrylog_config.yaml
 ENV SENTRYLOG_DB_PATH=/app/data/sentrylog.db
+ENV SENTRYLOG_BACKUP_DIR=/app/data/backups
 
 # Dashboard port
 EXPOSE 8514

@@ -105,9 +105,58 @@ except ImportError:
 # ---------------------------------------------------------------------------
 VERSION = "6.0.0"
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "sentrylog.db"
-DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
-BACKUP_DIR = BASE_DIR / "backups"
+
+
+def _resolve_path(env_var, default):
+    """Resolve a filesystem path from an environment variable.
+
+    Container deployments mount a volume and point these variables at it, so
+    the database, config and backups survive container replacement. When the
+    variable is unset we fall back to the historical layout next to the
+    script, which keeps bare-metal installs working unchanged.
+    """
+    raw = os.getenv(env_var)
+    if raw:
+        return Path(raw).expanduser()
+    return Path(default)
+
+
+DATA_DIR = _resolve_path("SENTRYLOG_DATA_DIR", BASE_DIR)
+DB_PATH = _resolve_path("SENTRYLOG_DB_PATH", DATA_DIR / "sentrylog.db")
+DEFAULT_CFG = _resolve_path("SENTRYLOG_CONFIG", DATA_DIR / "sentrylog_config.yaml")
+BACKUP_DIR = _resolve_path("SENTRYLOG_BACKUP_DIR", DATA_DIR / "backups")
+
+
+def _ensure_data_dirs():
+    """Create the data/backup directories and migrate legacy files into them.
+
+    Older images wrote sentrylog.db and sentrylog_config.yaml next to
+    sentrylog.py (inside the image layer, so they were lost on container
+    replacement). If a data dir is now configured and only the legacy copies
+    exist, copy them over once.
+    """
+    for directory in (DATA_DIR, DB_PATH.parent, DEFAULT_CFG.parent, BACKUP_DIR):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("Could not create directory %s: %s", directory, exc)
+
+    legacy_pairs = (
+        (BASE_DIR / "sentrylog.db", DB_PATH),
+        (BASE_DIR / "sentrylog_config.yaml", DEFAULT_CFG),
+    )
+    for legacy, target in legacy_pairs:
+        try:
+            if legacy.resolve() == target.resolve():
+                continue
+        except OSError:
+            continue
+        if legacy.is_file() and not target.exists():
+            try:
+                shutil.copy2(str(legacy), str(target))
+                log.info("Migrated %s -> %s", legacy, target)
+            except OSError as exc:
+                log.warning("Could not migrate %s: %s", legacy, exc)
 
 # Tables that hold configuration (backed up). Logs/alerts are NOT included.
 BACKUP_CONFIG_TABLES = [
@@ -6398,6 +6447,10 @@ def main():
     print("  [OK] Log forwarding to external SIEM available")
     print("  [OK] API key authentication available")
     print()
+
+    _ensure_data_dirs()
+    log.info("Data dir: %s | config: %s | db: %s | backups: %s",
+             DATA_DIR, DEFAULT_CFG, DB_PATH, BACKUP_DIR)
 
     # Load config
     cfg = load_config()
