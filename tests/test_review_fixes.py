@@ -9,6 +9,8 @@ import datetime
 import sqlite3
 import threading
 
+import pytest
+
 from conftest import make_entry
 
 
@@ -168,6 +170,47 @@ def test_reclaim_disk_space_shrinks_the_file(sentrylog):
     reclaimed = sentrylog.reclaim_disk_space()
     assert reclaimed > 0
     assert sentrylog.database_size_mb() < before
+
+
+class _FailingSQL:
+    """Wraps a sqlite3 connection and fails statements containing a marker.
+
+    Models the real failure modes of space reclamation: VACUUM needs free disk
+    and a writable temp dir, and a checkpoint can be blocked by a reader -- both
+    surface as sqlite3.OperationalError, exactly when the disk is already full.
+    """
+
+    def __init__(self, conn, marker):
+        self._conn = conn
+        self._marker = marker
+
+    def execute(self, sql, *args, **kwargs):
+        if self._marker in sql.upper():
+            raise sqlite3.OperationalError("injected failure: %s" % self._marker)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@pytest.mark.parametrize("marker", ["VACUUM", "WAL_CHECKPOINT"])
+def test_disk_pressure_cleanup_stops_when_reclamation_errors(
+        sentrylog, monkeypatch, marker):
+    """If reclamation itself fails, stop deleting -- do not chase the floor."""
+    _insert_old_logs(sentrylog, 1000)
+    monkeypatch.setattr(sentrylog, "_SIZE_CLEANUP_CHUNK", 100)
+    monkeypatch.setattr(sentrylog, "free_disk_mb",
+                        lambda: sentrylog._MIN_FREE_DISK_MB - 10)
+    real_get_db = sentrylog.get_db
+    monkeypatch.setattr(sentrylog, "get_db",
+                        lambda *a, **k: _FailingSQL(real_get_db(*a, **k), marker))
+
+    sentrylog.enforce_storage_limit(max_mb=100)
+
+    remaining = _log_count(sentrylog)
+    assert remaining >= 900, (
+        "reclamation failed with %s and cleanup still removed %d of 1000 rows"
+        % (marker, 1000 - remaining))
 
 
 # --------------------------------------------------------------------------
