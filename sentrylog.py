@@ -1119,11 +1119,35 @@ def spool_batch(batch, reason=""):
 
 
 def replay_spool():
-    """Re-attempt spooled batches. Returns the number of events replayed."""
+    """Re-attempt spooled batches. Returns the number of events replayed.
+
+    Serialized on _spool_replay_lock and each file is *claimed* by an atomic
+    rename before it is read: two concurrent callers (the replay loop and a
+    startup replay) would otherwise both read the same batch and write it
+    twice, duplicating events.
+    """
     replayed = 0
     if not SPOOL_DIR.exists():
         return 0
-    for path in sorted(SPOOL_DIR.glob("batch_*.jsonl")):
+    if not _spool_replay_lock.acquire(blocking=False):
+        # Another replay is already draining the spool; nothing to do.
+        return 0
+    try:
+        return _replay_spool_locked()
+    finally:
+        _spool_replay_lock.release()
+
+
+def _replay_spool_locked():
+    replayed = 0
+    for spooled in sorted(SPOOL_DIR.glob("batch_*.jsonl")):
+        # Claim the file. os.rename is atomic, so exactly one caller can win
+        # even if the lock above is bypassed by a separate process.
+        path = spooled.with_suffix(".jsonl.claimed")
+        try:
+            os.replace(str(spooled), str(path))
+        except OSError:
+            continue
         try:
             with open(str(path), encoding="utf-8") as fh:
                 batch = [json_mod.loads(line) for line in fh if line.strip()]
@@ -1137,6 +1161,11 @@ def replay_spool():
             alerts = write_batch(batch)
         except Exception as exc:
             log.warning("Spool replay for %s still failing: %s", path.name, exc)
+            # Hand the batch back so the next round retries it.
+            try:
+                os.replace(str(path), str(spooled))
+            except OSError:
+                pass
             break  # database is still unhappy; try again next round
         _queue_alerts(alerts)
         _bump("written", len(batch))
@@ -1211,6 +1240,25 @@ def _writer_loop():
         finally:
             for _ in batch:
                 _ingest_queue.task_done()
+
+
+_spool_replay_lock = threading.Lock()
+
+
+def recover_claimed_spool_files():
+    """Un-claim spool files left mid-replay by a crash, so they replay again."""
+    if not SPOOL_DIR.exists():
+        return 0
+    recovered = 0
+    for claimed in SPOOL_DIR.glob("batch_*.jsonl.claimed"):
+        try:
+            os.replace(str(claimed), str(claimed.with_suffix("")))
+            recovered += 1
+        except OSError as exc:
+            log.warning("Could not recover spool file %s: %s", claimed.name, exc)
+    if recovered:
+        log.info("Recovered %d spool file(s) claimed by a previous run", recovered)
+    return recovered
 
 
 def _spool_replay_loop(interval=30):
@@ -2453,6 +2501,9 @@ AGE_RETENTION_TABLES = (
 )
 _SIZE_CLEANUP_CHUNK = 20000
 _SIZE_CLEANUP_TARGET = 0.9  # trim down to 90% of the limit
+# Hard stop on one enforcement pass, so a mis-set limit or a bad size reading
+# can never walk the whole table in a single run.
+_SIZE_CLEANUP_MAX_ROWS = 2000000
 _MIN_FREE_DISK_MB = 256
 
 
@@ -2465,6 +2516,60 @@ def database_size_mb():
         except OSError:
             pass
     return total / (1024.0 * 1024.0)
+
+
+def reusable_db_mb():
+    """MiB already freed inside the database file but not yet given back.
+
+    SQLite keeps pages emptied by DELETE on a freelist and only returns them to
+    the filesystem on VACUUM, so the file size does not move while a cleanup
+    loop deletes. Counting the freelist is what makes "how big is this database
+    really" answerable mid-cleanup.
+    """
+    try:
+        conn = get_db()
+    except Exception:
+        return 0.0
+    try:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return (int(page_size) * int(free_pages)) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def effective_db_size_mb():
+    """How much space the data actually occupies, in MiB.
+
+    Measured from page accounting (pages in use x page size) rather than the
+    file size, because neither part of the file responds to a DELETE promptly:
+    the main database only shrinks on VACUUM, and the WAL *grows* as pages are
+    modified. Comparing either against the limit makes a cleanup loop delete
+    everything it is allowed to delete. Falls back to the file size if the
+    pragmas are unavailable.
+    """
+    try:
+        conn = get_db()
+    except Exception:
+        return database_size_mb()
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        used = max(0, page_count - free_pages)
+        return (used * page_size) / (1024.0 * 1024.0)
+    except Exception:
+        return database_size_mb()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def free_disk_mb():
@@ -2535,7 +2640,7 @@ def enforce_storage_limit(max_mb=None):
     if limit <= 0:
         return {"enforced": False, "reason": "no_limit"}
 
-    size = database_size_mb()
+    size = effective_db_size_mb()
     free = free_disk_mb()
     disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
     if size <= limit and not disk_pressure:
@@ -2552,7 +2657,11 @@ def enforce_storage_limit(max_mb=None):
     conn = get_db()
     try:
         while True:
-            size = database_size_mb()
+            # Effective size, not file size: pages freed by the DELETEs below
+            # stay allocated until the VACUUM after this loop, so measuring the
+            # file would keep the loop deleting until nothing is left above the
+            # retention floor.
+            size = effective_db_size_mb()
             if size <= target and not disk_pressure:
                 break
             cursor = conn.cursor()
@@ -2569,6 +2678,10 @@ def enforce_storage_limit(max_mb=None):
                             limit, size, min_keep_hours)
                 break
             removed += chunk
+            if removed >= _SIZE_CLEANUP_MAX_ROWS:
+                log.warning("Storage cleanup stopped after %d rows in one pass "
+                            "-- will continue on the next cycle", removed)
+                break
             if disk_pressure:
                 free = free_disk_mb()
                 disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
@@ -2587,7 +2700,9 @@ def enforce_storage_limit(max_mb=None):
         except Exception:
             pass
     return {"enforced": True, "removed": removed,
-            "size_mb": round(database_size_mb(), 2), "limit_mb": limit}
+            "size_mb": round(database_size_mb(), 2),
+            "effective_size_mb": round(effective_db_size_mb(), 2),
+            "limit_mb": limit}
 
 
 def cleanup_loop():
@@ -4873,6 +4988,30 @@ _ENDPOINT_PERMS = {
     "api_restore": "config",
 }
 
+# Endpoints decorated with @optional_api_auth: reachable with a scoped API key
+# as well as a dashboard token. Keep in sync with the decorator usage below.
+_API_KEY_ENDPOINTS = {
+    "api_backup_list",
+    "api_backup_create",
+    "api_backup_download",
+    "api_backup_restore",
+    "api_backup_delete",
+}
+
+# API-key permission levels, widest last.
+_API_KEY_PERMS = {
+    "read": {"read"},
+    "write": {"read", "write"},
+    "admin": {"read", "write", "config"},
+}
+
+
+def _api_key_has_perm(row, required):
+    """Whether an API key row satisfies the permission a route requires."""
+    level = str((row or {}).get("permissions", "read") or "read").lower()
+    return required in _API_KEY_PERMS.get(level, {"read"})
+
+
 _SECRET_CONFIG_KEYS = ("password", "secret", "token", "api_key", "apikey")
 
 
@@ -4921,13 +5060,41 @@ if HAS_FLASK:
         Protected by default: a route has to be listed in
         _AUTH_EXEMPT_ENDPOINTS (or be self-authenticating ingestion) to be
         reachable without a dashboard token.
+
+        Routes that carry @optional_api_auth are also reachable with a valid
+        API key, so turning dashboard auth on does not lock out existing
+        machine clients. The key still has to pass the same permission check a
+        dashboard user would -- it is not a way around authorization.
         """
         endpoint = request.endpoint
         if endpoint is None or endpoint in _AUTH_EXEMPT_ENDPOINTS:
             return None
         if endpoint in _SELF_AUTHENTICATED_ENDPOINTS:
             return None
-        _check_user_auth(_required_perm_for(endpoint, request.method))
+        required = _required_perm_for(endpoint, request.method)
+        if endpoint in _API_KEY_ENDPOINTS:
+            # API keys carry their own read/write/admin scale; a plain read key
+            # must keep working for GETs it could always reach.
+            key_required = ("read" if request.method in ("GET", "HEAD", "OPTIONS")
+                            else "config")
+            presented = (request.headers.get("X-API-Key", "")
+                         or request.args.get("api_key", ""))
+            if presented:
+                row = validate_api_key(presented)
+                if not row:
+                    return jsonify({
+                        "error": "invalid_api_key",
+                        "message": "Invalid or expired API key.",
+                    }), 401
+                if not _api_key_has_perm(row, key_required):
+                    return jsonify({
+                        "error": "insufficient_permissions",
+                        "message": "This API key cannot perform this action.",
+                    }), 403
+                # The route's own @optional_api_auth re-validates and applies
+                # rate limiting; this gate only decides reachability.
+                return None
+        _check_user_auth(required)
         return None
 
     @app.route("/")
@@ -7151,10 +7318,11 @@ def main():
         t.start()
         threads.append(t)
 
-    # Start the ingestion workers (batch writer, forwarding, alerts, spool
-    # replay) and re-attempt anything spooled by a previous run.
-    start_ingest_workers()
+    # Re-attempt anything spooled by a previous run *before* the replay loop
+    # exists, so there is only ever one replay owner at a time.
+    recover_claimed_spool_files()
     replayed = replay_spool()
+    start_ingest_workers()
     if replayed:
         log.info("Replayed %d events spooled by a previous run", replayed)
 
