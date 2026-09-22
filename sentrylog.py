@@ -2504,6 +2504,12 @@ _SIZE_CLEANUP_TARGET = 0.9  # trim down to 90% of the limit
 # Hard stop on one enforcement pass, so a mis-set limit or a bad size reading
 # can never walk the whole table in a single run.
 _SIZE_CLEANUP_MAX_ROWS = 2000000
+# Under disk pressure, reclaim filesystem space after this many delete chunks.
+# Deleting alone frees nothing on disk, so the loop has to VACUUM as it goes or
+# it can never observe the free space it is trying to create.
+_DISK_RECLAIM_EVERY_CHUNKS = 1
+# Minimum free-space gain that counts as progress for one reclaim attempt.
+_DISK_RECLAIM_MIN_PROGRESS_MB = 0.01
 _MIN_FREE_DISK_MB = 256
 
 
@@ -2570,6 +2576,42 @@ def effective_db_size_mb():
             conn.close()
         except Exception:
             pass
+
+
+def reclaim_disk_space(conn=None):
+    """Return freed database pages to the filesystem. Returns MiB reclaimed.
+
+    Truncates the WAL first (it can be larger than the data it describes after
+    a bulk delete) and then VACUUMs. Without this, a delete loop watching free
+    disk space sees no improvement no matter how much it deletes.
+    """
+    before = database_size_mb()
+    own = conn is None
+    if own:
+        try:
+            conn = get_db()
+        except Exception:
+            return 0.0
+    try:
+        conn.execute("VACUUM")
+        # VACUUM rewrites the database *through the WAL*, so the WAL holds a
+        # second copy until it is checkpointed. Truncating afterwards is what
+        # actually hands the space back to the filesystem; skipping it leaves
+        # the file temporarily larger than before the VACUUM.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            log.debug("WAL checkpoint skipped: %s", exc)
+    except sqlite3.Error as exc:
+        log.debug("VACUUM skipped: %s", exc)
+        return 0.0
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return max(0.0, before - database_size_mb())
 
 
 def free_disk_mb():
@@ -2654,6 +2696,8 @@ def enforce_storage_limit(max_mb=None):
                 - datetime.timedelta(hours=min_keep_hours)
                 ).strftime("%Y-%m-%d %H:%M:%S")
     removed = 0
+    chunks_since_reclaim = 0
+    last_free = free
     conn = get_db()
     try:
         while True:
@@ -2683,13 +2727,33 @@ def enforce_storage_limit(max_mb=None):
                             "-- will continue on the next cycle", removed)
                 break
             if disk_pressure:
-                free = free_disk_mb()
-                disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
+                # Deleting rows does not give the filesystem anything back, so
+                # free space cannot improve until the freed pages are reclaimed.
+                # Reclaim, then re-measure -- and if a reclaim buys nothing, the
+                # shortage is not ours to fix by deleting history, so stop.
+                chunks_since_reclaim += 1
+                if chunks_since_reclaim >= _DISK_RECLAIM_EVERY_CHUNKS:
+                    chunks_since_reclaim = 0
+                    reclaimed = reclaim_disk_space(conn)
+                    free = free_disk_mb()
+                    disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
+                    if disk_pressure:
+                        gained = (None if (free is None or last_free is None)
+                                  else free - last_free)
+                        if (reclaimed <= 0.0 and
+                                (gained is None or
+                                 gained < _DISK_RECLAIM_MIN_PROGRESS_MB)):
+                            log.warning(
+                                "Low disk (%s MiB free) is not improving after "
+                                "reclaiming space and removing %d logs -- "
+                                "stopping cleanup; free space is needed "
+                                "elsewhere on the volume",
+                                "unknown" if free is None else "%.0f" % free,
+                                removed)
+                            break
+                        last_free = free
         if removed:
-            try:
-                conn.execute("VACUUM")
-            except sqlite3.Error as exc:
-                log.debug("VACUUM skipped: %s", exc)
+            reclaim_disk_space(conn)
             log.info("Storage limit: removed %d oldest logs (now %.1f MiB of "
                      "%.0f MiB)", removed, database_size_mb(), limit)
     except Exception as exc:

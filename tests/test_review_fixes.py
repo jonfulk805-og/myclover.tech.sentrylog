@@ -105,6 +105,72 @@ def test_min_retention_still_protects_recent_logs(sentrylog, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# 1b. Storage enforcement under disk pressure (follow-up review of 63f9f51)
+# --------------------------------------------------------------------------
+
+def test_disk_pressure_cleanup_stops_once_space_is_reclaimed(
+        sentrylog, monkeypatch):
+    """The low-disk branch must reclaim and remeasure, not delete everything.
+
+    Free space is modelled as tracking the physical database file, which is what
+    it does on a real volume: it only improves when freed pages are actually
+    returned to the filesystem.
+    """
+    _insert_old_logs(sentrylog, 1000)
+    monkeypatch.setattr(sentrylog, "_SIZE_CLEANUP_CHUNK", 100)
+    physical_before = sentrylog.database_size_mb()
+    threshold = sentrylog._MIN_FREE_DISK_MB
+
+    def fake_free():
+        # Starts 0.1 MiB below the threshold; rises as the file shrinks.
+        return (threshold - 0.1) + physical_before - sentrylog.database_size_mb()
+
+    monkeypatch.setattr(sentrylog, "free_disk_mb", fake_free)
+
+    # Limit is far above the database size, so only disk pressure drives this.
+    sentrylog.enforce_storage_limit(max_mb=100)
+
+    remaining = _log_count(sentrylog)
+    assert remaining > 0, "low-disk cleanup deleted every eligible row"
+    # It should delete roughly what the shortfall needs, not the whole table.
+    assert remaining >= 600, (
+        "low-disk cleanup removed %d of 1000 rows to free 0.1 MiB"
+        % (1000 - remaining))
+    assert fake_free() >= threshold
+
+
+def test_disk_pressure_cleanup_stops_when_reclaim_makes_no_progress(
+        sentrylog, monkeypatch):
+    """If free space never improves, the shortage is not ours to delete away."""
+    _insert_old_logs(sentrylog, 500)
+    monkeypatch.setattr(sentrylog, "_SIZE_CLEANUP_CHUNK", 50)
+    # Space is short and stays short no matter what we delete (something else
+    # on the volume is eating it).
+    monkeypatch.setattr(sentrylog, "free_disk_mb",
+                        lambda: sentrylog._MIN_FREE_DISK_MB - 50)
+    monkeypatch.setattr(sentrylog, "reclaim_disk_space",
+                        lambda conn=None: 0.0)
+
+    sentrylog.enforce_storage_limit(max_mb=100)
+
+    remaining = _log_count(sentrylog)
+    assert remaining > 0, "cleanup deleted all history chasing unreclaimable space"
+    assert remaining >= 400, "cleanup removed %d of 500 rows" % (500 - remaining)
+
+
+def test_reclaim_disk_space_shrinks_the_file(sentrylog):
+    _insert_old_logs(sentrylog, 1000)
+    conn = sentrylog.get_db()
+    conn.execute("DELETE FROM logs")
+    conn.commit()
+    conn.close()
+    before = sentrylog.database_size_mb()
+    reclaimed = sentrylog.reclaim_disk_space()
+    assert reclaimed > 0
+    assert sentrylog.database_size_mb() < before
+
+
+# --------------------------------------------------------------------------
 # 2. Spool replay runs once
 # --------------------------------------------------------------------------
 
