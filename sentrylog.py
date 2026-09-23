@@ -5819,6 +5819,17 @@ if HAS_FLASK:
             safe["auth_enabled"] = _config.get("auth_enabled", False)
         return jsonify(redact_config(safe))
 
+    @app.route("/api/config/netmon-test", methods=["POST"])
+    def api_config_netmon_test():
+        """Try the saved NetMon settings once so the UI can say what is wrong."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        feed = fetch_netmon_feed(start=now - datetime.timedelta(hours=24),
+                                 end=now,
+                                 limit=50)
+        if feed["error"]:
+            return jsonify({"ok": False, "error": feed["error"]})
+        return jsonify({"ok": True, "events": len(feed["events"])})
+
     @app.route("/api/config", methods=["PUT"])
     def api_update_config():
         data = request.get_json(force=True)
