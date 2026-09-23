@@ -1,0 +1,108 @@
+# Replacement for .github/workflows/docker-publish.yml
+#
+# Install once (a GitHub App cannot push workflow files):
+#   git mv deploy/github-workflow-publish.yml .github/workflows/docker-publish.yml
+#   git commit -m "CI: run tests before publishing the image" && git push
+#
+# What changed: the image is only published if the test suite passes, and the
+# container-replacement test runs against the real Dockerfile.
+
+name: Build & Publish Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: jonfulk805-og/myclover-sentrylog
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
+
+  docker-persistence:
+    # Builds the image and proves data survives replacing the container.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sentrylog:ci .
+
+      - name: Create data, replace the container, check the data survived
+        run: |
+          set -eux
+          docker volume create sentrylog_ci_data
+          docker run -d --name sentrylog_ci -v sentrylog_ci_data:/app/data sentrylog:ci
+          sleep 20
+          docker exec sentrylog_ci ls -la /app/data
+          docker exec sentrylog_ci test -f /app/data/sentrylog.db
+          docker rm -f sentrylog_ci
+          docker run -d --name sentrylog_ci2 -v sentrylog_ci_data:/app/data sentrylog:ci
+          sleep 10
+          docker exec sentrylog_ci2 test -f /app/data/sentrylog.db
+          docker rm -f sentrylog_ci2
+          docker volume rm sentrylog_ci_data
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [test, docker-persistence]
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

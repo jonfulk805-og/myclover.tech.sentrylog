@@ -48,6 +48,7 @@ import smtplib
 import secrets
 import functools
 import base64
+import queue as queue_mod
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -105,9 +106,22 @@ except ImportError:
 # ---------------------------------------------------------------------------
 VERSION = "6.0.0"
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "sentrylog.db"
-DEFAULT_CFG = BASE_DIR / "sentrylog_config.yaml"
-BACKUP_DIR = BASE_DIR / "backups"
+
+
+def _env_path(name, default):
+    """Path from an environment variable, or a default. Empty means unset."""
+    val = os.environ.get(name, "").strip()
+    return Path(val).expanduser() if val else default
+
+
+# All persistent state lives under DATA_DIR so a single mounted volume
+# (docker: /app/data) survives container replacement.
+DATA_DIR = _env_path("SENTRYLOG_DATA_DIR", BASE_DIR)
+DB_PATH = _env_path("SENTRYLOG_DB_PATH", DATA_DIR / "sentrylog.db")
+DEFAULT_CFG = _env_path("SENTRYLOG_CONFIG", DATA_DIR / "sentrylog_config.yaml")
+BACKUP_DIR = _env_path("SENTRYLOG_BACKUP_DIR", DATA_DIR / "backups")
+SECRET_PATH = _env_path("SENTRYLOG_SECRET_FILE", DATA_DIR / "auth_secret.key")
+SPOOL_DIR = _env_path("SENTRYLOG_SPOOL_DIR", DATA_DIR / "spool")
 
 # Tables that hold configuration (backed up). Logs/alerts are NOT included.
 BACKUP_CONFIG_TABLES = [
@@ -135,6 +149,36 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("sentrylog")
+
+
+def _copy_if_missing(src, dst):
+    """Copy a legacy file into the data dir on first run. Never overwrites."""
+    if src == dst or not src.exists() or dst.exists():
+        return False
+    try:
+        shutil.copy2(str(src), str(dst))
+        log.info("Migrated %s -> %s", src, dst)
+        return True
+    except OSError as exc:
+        log.warning("Could not migrate %s: %s", src, exc)
+        return False
+
+
+def ensure_data_dir():
+    """Create data/backup/spool dirs and migrate pre-volume installs once."""
+    for d in (DATA_DIR, BACKUP_DIR, SPOOL_DIR, DB_PATH.parent, DEFAULT_CFG.parent):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("Cannot create %s: %s", d, exc)
+    _copy_if_missing(BASE_DIR / "sentrylog.db", DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        _copy_if_missing(Path(str(BASE_DIR / "sentrylog.db") + suffix),
+                         Path(str(DB_PATH) + suffix))
+    _copy_if_missing(BASE_DIR / "sentrylog_config.yaml", DEFAULT_CFG)
+
+
+ensure_data_dir()
 
 # ---------------------------------------------------------------------------
 # License / Tier System (compatible with netmon keys)
@@ -316,8 +360,12 @@ def load_config(path=None):
         return _config
     with open(cfg_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    migrated = migrate_user_passwords(data)
     with _config_lock:
         _config = data
+    if migrated:
+        save_config(data, cfg_path)
+        log.info("Migrated plaintext user passwords to PBKDF2 hashes")
     return _config
 
 
@@ -342,7 +390,13 @@ def _default_config():
         "storage": {
             "retention_days": 30,
             "cleanup_interval_hours": 6,
+            # Enforced: oldest logs are trimmed in bounded chunks once the
+            # database (incl. WAL) passes this size.
             "max_db_size_mb": 500,
+            "min_retention_hours": 1,
+            "notification_retention_days": 90,
+            "incident_retention_days": 180,
+            "report_retention_days": 365,
         },
         "dashboard": {
             "host": "0.0.0.0",
@@ -874,42 +928,137 @@ def parse_syslog_message(data, source_ip):
 # ---------------------------------------------------------------------------
 # Log Ingestion Engine
 # ---------------------------------------------------------------------------
-_log_buffer = []
-_log_buffer_lock = threading.Lock()
+_log_buffer_lock = threading.Lock()  # kept: serializes force-flush callers
 _BUFFER_FLUSH_SIZE = 100
 _BUFFER_FLUSH_INTERVAL = 2  # seconds
 
 
+# Ingestion pipeline
+# ------------------
+# Receivers only enqueue. A writer thread batches into SQLite inside a single
+# transaction and only removes entries from the queue once the commit
+# succeeded; a batch that cannot be written is retried and then spooled to disk
+# (SPOOL_DIR) and replayed later, so a database error can no longer silently
+# swallow a batch. Forwarding, correlation and alert delivery run on their own
+# workers, off the receive path and outside the ingest transaction.
+
+_INGEST_QUEUE_MAX = int(os.environ.get("SENTRYLOG_QUEUE_MAX", "50000") or 50000)
+_ingest_queue = queue_mod.Queue(maxsize=_INGEST_QUEUE_MAX)
+_post_queue = queue_mod.Queue(maxsize=_INGEST_QUEUE_MAX)
+_alert_queue = queue_mod.Queue(maxsize=5000)
+_WRITE_RETRIES = 3
+_WRITE_RETRY_DELAY = 0.5
+_SPOOL_MAX_FILES = 500
+
+_ingest_stats_lock = threading.Lock()
+_ingest_stats = {
+    "received": 0,
+    "written": 0,
+    "dropped_queue_full": 0,
+    "write_retries": 0,
+    "spooled_batches": 0,
+    "spooled_events": 0,
+    "replayed_events": 0,
+    "last_write_error": None,
+    "last_write_at": None,
+}
+_workers_started = False
+
+
+def _bump(metric, amount=1):
+    with _ingest_stats_lock:
+        _ingest_stats[metric] = _ingest_stats.get(metric, 0) + amount
+
+
 def ingest_log(parsed):
-    """Add a parsed log entry to the buffer for batch insertion."""
-    # Phase 4: Feed correlation engine
-    _corr_add_event(parsed)
-
-    # Phase 6: Forward log to external targets
+    """Queue a parsed log entry. Never writes to the database inline."""
+    _bump("received")
     try:
-        forward_log(parsed)
-    except Exception:
-        pass
-
-    with _log_buffer_lock:
-        _log_buffer.append(parsed)
-        if len(_log_buffer) >= _BUFFER_FLUSH_SIZE:
-            _flush_logs()
-
-
-def _flush_logs():
-    """Flush buffered logs to the database. Must hold _log_buffer_lock."""
-    global _log_buffer
-    if not _log_buffer:
-        return
-    batch = _log_buffer[:]
-    _log_buffer = []
-
+        _ingest_queue.put_nowait(parsed)
+    except queue_mod.Full:
+        _bump("dropped_queue_full")
+        log.error("Ingest queue full (%d) -- dropped an event from %s",
+                  _INGEST_QUEUE_MAX, parsed.get("source_ip"))
+        return False
     try:
-        conn = get_db()
-        c = conn.cursor()
+        # Correlation and forwarding happen after buffering, not before, so a
+        # slow forwarding target cannot stall or duplicate ingestion.
+        _post_queue.put_nowait(parsed)
+    except queue_mod.Full:
+        log.warning("Forward/correlation queue full -- skipping side effects "
+                    "for one event")
+    return True
+
+
+def _post_ingest_loop():
+    """Correlation + forwarding worker."""
+    while True:
+        entry = _post_queue.get()
+        try:
+            if entry is None:
+                return
+            try:
+                _corr_add_event(entry)
+            except Exception as exc:
+                log.debug("Correlation error: %s", exc)
+            try:
+                forward_log(entry)
+            except Exception as exc:
+                log.debug("Forwarding error: %s", exc)
+        finally:
+            _post_queue.task_done()
+
+
+def _alert_delivery_loop():
+    """Alert notification worker: delivery never runs inside an ingest txn."""
+    while True:
+        job = _alert_queue.get()
+        try:
+            if job is None:
+                return
+            conn = None
+            try:
+                conn = get_db()
+                cursor = conn.cursor()
+                _send_alert_notifications(cursor, job["rule_name"],
+                                          job["severity"], job["source_ip"],
+                                          job["message"])
+                conn.commit()
+            except Exception as exc:
+                log.error("Alert notification failed for rule %s: %s",
+                          job.get("rule_name"), exc)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        finally:
+            _alert_queue.task_done()
+
+
+def _queue_alerts(jobs):
+    for job in jobs:
+        try:
+            _alert_queue.put_nowait(job)
+        except queue_mod.Full:
+            log.error("Alert queue full -- dropped notification for rule %s",
+                      job.get("rule_name"))
+
+
+def write_batch(batch):
+    """Insert a batch in one transaction. Returns queued alert jobs.
+
+    Raises on failure so the caller can retry or spool -- the batch is never
+    considered delivered unless the commit succeeded.
+    """
+    alerts = []
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
         for entry in batch:
-            c.execute("""
+            cursor.execute("""
                 INSERT INTO logs (timestamp, received_at, source_ip, source_name,
                     facility, facility_code, severity, severity_code,
                     app_name, process_id, message, raw)
@@ -921,11 +1070,8 @@ def _flush_logs():
                 entry["app_name"], entry["process_id"],
                 entry["message"], entry["raw"],
             ))
-
-            log_id = c.lastrowid
-
-            # Update source tracking
-            c.execute("""
+            log_id = cursor.lastrowid
+            cursor.execute("""
                 INSERT INTO sources (ip, name, first_seen, last_seen, log_count)
                 VALUES (?, ?, ?, ?, 1)
                 ON CONFLICT(ip) DO UPDATE SET
@@ -934,30 +1080,252 @@ def _flush_logs():
                     name = CASE WHEN sources.name = '' THEN excluded.name
                            ELSE sources.name END
             """, (
-                entry["source_ip"],
-                entry["source_name"],
-                entry["received_at"],
-                entry["received_at"],
+                entry["source_ip"], entry["source_name"],
+                entry["received_at"], entry["received_at"],
             ))
-
-            # Check alert rules
-            _check_alert_rules(c, entry, log_id)
-
+            alerts.extend(_check_alert_rules(cursor, entry, log_id) or [])
         conn.commit()
-        conn.close()
-    except Exception as e:
-        log.error("Failed to flush logs: %s", e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return alerts
+
+
+def spool_batch(batch, reason=""):
+    """Persist a batch we could not write, so it is not lost."""
+    try:
+        SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+        existing = sorted(SPOOL_DIR.glob("batch_*.jsonl"))
+        if len(existing) >= _SPOOL_MAX_FILES:
+            log.error("Spool directory is full (%d files) -- dropping %d events",
+                      len(existing), len(batch))
+            _bump("dropped_queue_full", len(batch))
+            return None
+        path = SPOOL_DIR / ("batch_%s_%s.jsonl" % (
+            datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"),
+            secrets.token_hex(4)))
+        with open(str(path), "w", encoding="utf-8") as fh:
+            for entry in batch:
+                fh.write(json_mod.dumps(entry) + "\n")
+        _bump("spooled_batches")
+        _bump("spooled_events", len(batch))
+        log.error("Spooled %d events to %s (%s)", len(batch), path.name, reason)
+        return path
+    except Exception as exc:
+        log.error("Could not spool %d events: %s", len(batch), exc)
+        return None
+
+
+def replay_spool():
+    """Re-attempt spooled batches. Returns the number of events replayed.
+
+    Serialized on _spool_replay_lock and each file is *claimed* by an atomic
+    rename before it is read: two concurrent callers (the replay loop and a
+    startup replay) would otherwise both read the same batch and write it
+    twice, duplicating events.
+    """
+    replayed = 0
+    if not SPOOL_DIR.exists():
+        return 0
+    if not _spool_replay_lock.acquire(blocking=False):
+        # Another replay is already draining the spool; nothing to do.
+        return 0
+    try:
+        return _replay_spool_locked()
+    finally:
+        _spool_replay_lock.release()
+
+
+def _replay_spool_locked():
+    replayed = 0
+    for spooled in sorted(SPOOL_DIR.glob("batch_*.jsonl")):
+        # Claim the file. os.rename is atomic, so exactly one caller can win
+        # even if the lock above is bypassed by a separate process.
+        path = spooled.with_suffix(".jsonl.claimed")
+        try:
+            os.replace(str(spooled), str(path))
+        except OSError:
+            continue
+        try:
+            with open(str(path), encoding="utf-8") as fh:
+                batch = [json_mod.loads(line) for line in fh if line.strip()]
+        except Exception as exc:
+            log.error("Unreadable spool file %s: %s", path.name, exc)
+            continue
+        if not batch:
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            alerts = write_batch(batch)
+        except Exception as exc:
+            log.warning("Spool replay for %s still failing: %s", path.name, exc)
+            # Hand the batch back so the next round retries it.
+            try:
+                os.replace(str(path), str(spooled))
+            except OSError:
+                pass
+            break  # database is still unhappy; try again next round
+        _queue_alerts(alerts)
+        _bump("written", len(batch))
+        _bump("replayed_events", len(batch))
+        replayed += len(batch)
+        path.unlink(missing_ok=True)
+        log.info("Replayed %d spooled events from %s", len(batch), path.name)
+    return replayed
+
+
+def persist_batch(batch):
+    """Write a batch with retries, spooling to disk as the last resort."""
+    if not batch:
+        return True
+    last_error = None
+    for attempt in range(_WRITE_RETRIES):
+        try:
+            alerts = write_batch(batch)
+        except Exception as exc:
+            last_error = exc
+            _bump("write_retries")
+            log.warning("Log write attempt %d/%d failed: %s",
+                        attempt + 1, _WRITE_RETRIES, exc)
+            time.sleep(_WRITE_RETRY_DELAY * (attempt + 1))
+            continue
+        _queue_alerts(alerts)
+        _bump("written", len(batch))
+        with _ingest_stats_lock:
+            _ingest_stats["last_write_at"] = datetime.datetime.now().isoformat()
+        return True
+    with _ingest_stats_lock:
+        _ingest_stats["last_write_error"] = str(last_error)
+    spool_batch(batch, reason=str(last_error))
+    return False
+
+
+def _drain_queue(limit):
+    batch = []
+    while len(batch) < limit:
+        try:
+            batch.append(_ingest_queue.get_nowait())
+        except queue_mod.Empty:
+            break
+    return batch
+
+
+def _flush_logs():
+    """Write everything currently queued. Synchronous; used by force-flush."""
+    written = True
+    while True:
+        batch = _drain_queue(_BUFFER_FLUSH_SIZE)
+        if not batch:
+            break
+        try:
+            written = persist_batch(batch) and written
+        finally:
+            for _ in batch:
+                _ingest_queue.task_done()
+    return written
+
+
+def _writer_loop():
+    """Batch writer: drains the ingest queue on size or time."""
+    while _running:
+        try:
+            first = _ingest_queue.get(timeout=_BUFFER_FLUSH_INTERVAL)
+        except queue_mod.Empty:
+            continue
+        batch = [first] + _drain_queue(_BUFFER_FLUSH_SIZE - 1)
+        try:
+            persist_batch(batch)
+        finally:
+            for _ in batch:
+                _ingest_queue.task_done()
+
+
+_spool_replay_lock = threading.Lock()
+
+
+def recover_claimed_spool_files():
+    """Un-claim spool files left mid-replay by a crash, so they replay again."""
+    if not SPOOL_DIR.exists():
+        return 0
+    recovered = 0
+    for claimed in SPOOL_DIR.glob("batch_*.jsonl.claimed"):
+        try:
+            os.replace(str(claimed), str(claimed.with_suffix("")))
+            recovered += 1
+        except OSError as exc:
+            log.warning("Could not recover spool file %s: %s", claimed.name, exc)
+    if recovered:
+        log.info("Recovered %d spool file(s) claimed by a previous run", recovered)
+    return recovered
+
+
+def _spool_replay_loop(interval=30):
+    while _running:
+        try:
+            replay_spool()
+        except Exception as exc:
+            log.error("Spool replay loop error: %s", exc)
+        for _ in range(interval):
+            if not _running:
+                return
+            time.sleep(1)
+
+
+def start_ingest_workers():
+    """Start the writer, forwarding and alert workers (idempotent)."""
+    global _workers_started
+    if _workers_started:
+        return
+    _workers_started = True
+    for target, name in ((_writer_loop, "sentrylog-writer"),
+                         (_post_ingest_loop, "sentrylog-forward"),
+                         (_alert_delivery_loop, "sentrylog-alerts"),
+                         (_spool_replay_loop, "sentrylog-spool")):
+        threading.Thread(target=target, name=name, daemon=True).start()
+
+
+def get_ingest_health():
+    """Queue depth, ingestion lag and dropped-event counters."""
+    with _ingest_stats_lock:
+        stats = dict(_ingest_stats)
+    stats["queue_depth"] = _ingest_queue.qsize()
+    stats["queue_max"] = _INGEST_QUEUE_MAX
+    stats["forward_queue_depth"] = _post_queue.qsize()
+    stats["alert_queue_depth"] = _alert_queue.qsize()
+    try:
+        stats["spool_files"] = len(list(SPOOL_DIR.glob("batch_*.jsonl")))
+    except Exception:
+        stats["spool_files"] = None
+    last = stats.get("last_write_at")
+    if last:
+        try:
+            stats["seconds_since_last_write"] = round(
+                (datetime.datetime.now()
+                 - datetime.datetime.fromisoformat(last)).total_seconds(), 1)
+        except ValueError:
+            stats["seconds_since_last_write"] = None
+    else:
+        stats["seconds_since_last_write"] = None
+    stats["backlogged"] = stats["queue_depth"] > _INGEST_QUEUE_MAX * 0.8
+    return stats
 
 
 def _check_alert_rules(cursor, entry, log_id):
-    """Check a log entry against all enabled alert rules."""
+    """Check a log entry against enabled rules.
+
+    Returns a list of notification jobs. Delivery happens on the alert worker
+    after the ingest transaction commits -- never inside it.
+    """
+    jobs = []
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         rules = cursor.execute(
             "SELECT * FROM alert_rules WHERE enabled = 1"
         ).fetchall()
     except Exception:
-        return
+        return jobs
 
     for rule in rules:
         # Check cooldown
@@ -1028,11 +1396,16 @@ def _check_alert_rules(cursor, entry, log_id):
             log.info("[ALERT] Rule '%s' fired on log from %s: %s",
                      rule["name"], entry["source_ip"], entry["message"][:100])
 
-            # Phase 5: Send notifications for this alert
-            _send_alert_notifications(
-                cursor, rule["name"], entry["severity"],
-                entry["source_ip"], entry["message"][:500]
-            )
+            # Phase 5: queue notifications; the alert worker delivers them
+            # once this transaction has committed.
+            jobs.append({
+                "rule_name": rule["name"],
+                "severity": entry["severity"],
+                "source_ip": entry["source_ip"],
+                "message": entry["message"][:500],
+            })
+
+    return jobs
 
 
 # ---------------------------------------------------------------------------
@@ -1784,19 +2157,105 @@ def optional_api_auth(f):
 
 
 def _buffer_flush_loop():
-    """Periodically flush the log buffer."""
+    """Backwards-compatible entry point: the writer thread does the batching."""
+    start_ingest_workers()
     while _running:
         time.sleep(_BUFFER_FLUSH_INTERVAL)
-        with _log_buffer_lock:
-            if _log_buffer:
-                _flush_logs()
 
 
 # ---------------------------------------------------------------------------
 # User Authentication (token-based, stored in config.yaml)
 # ---------------------------------------------------------------------------
-_USER_AUTH_SECRET = b"sentrylog-user-auth-2026"
 _USER_AUTH_TOKEN_EXPIRY = 86400  # 24 hours
+_PBKDF2_ROUNDS = 200000
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+def _load_or_create_secret():
+    """Per-installation token signing secret, persisted in the data dir.
+
+    Never hard-coded: a fixed secret in public source lets anyone mint an
+    admin token. SENTRYLOG_AUTH_SECRET overrides.
+    """
+    env = os.environ.get("SENTRYLOG_AUTH_SECRET", "").strip()
+    if env:
+        return env.encode("utf-8")
+    try:
+        if SECRET_PATH.exists():
+            data = SECRET_PATH.read_bytes().strip()
+            if len(data) >= 32:
+                return data
+        secret = secrets.token_hex(32).encode("ascii")
+        SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SECRET_PATH.write_bytes(secret)
+        try:
+            os.chmod(str(SECRET_PATH), 0o600)
+        except OSError:
+            pass
+        log.info("Generated a new auth signing secret at %s", SECRET_PATH)
+        return secret
+    except OSError as exc:
+        log.warning("Cannot persist auth secret (%s) -- using an in-memory "
+                    "secret; sessions will not survive a restart", exc)
+        return secrets.token_hex(32).encode("ascii")
+
+
+_USER_AUTH_SECRET = _load_or_create_secret()
+
+
+def hash_password(password, salt=None, rounds=_PBKDF2_ROUNDS):
+    """PBKDF2-SHA256 hash string: pbkdf2_sha256$rounds$salt$hex."""
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             salt.encode("ascii"), rounds)
+    return "pbkdf2_sha256$%d$%s$%s" % (rounds, salt, dk.hex())
+
+
+def verify_password(password, stored):
+    """Verify a password against a stored hash. Plaintext is never accepted."""
+    if not stored or not isinstance(stored, str):
+        return False
+    parts = stored.split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    try:
+        rounds = int(parts[1])
+    except ValueError:
+        return False
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             parts[2].encode("ascii"), rounds)
+    return hmac.compare_digest(dk.hex(), parts[3])
+
+
+def migrate_user_passwords(cfg):
+    """Hash any plaintext `password:` entries in config. Returns True if changed."""
+    changed = False
+    for user in cfg.get("users", []) or []:
+        if not isinstance(user, dict):
+            continue
+        plain = user.pop("password", None)
+        if plain not in (None, "") and not user.get("password_hash"):
+            user["password_hash"] = hash_password(str(plain))
+            changed = True
+        elif plain not in (None, ""):
+            changed = True  # dropped a redundant plaintext copy
+    return changed
+
+
+def _find_user(username):
+    with _config_lock:
+        for user in _config.get("users", []) or []:
+            if isinstance(user, dict) and user.get("username") == username:
+                return dict(user)
+    return None
+
+
+def _token_version(user):
+    """Fingerprint of the credentials a token was issued against."""
+    material = "%s|%s|%s" % (user.get("username", ""), user.get("role", ""),
+                             user.get("password_hash", ""))
+    return hmac.new(_USER_AUTH_SECRET, material.encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:12]
 
 USER_AUTH_ROLES = {
     "admin": {"read", "write", "config", "users"},
@@ -1805,10 +2264,13 @@ USER_AUTH_ROLES = {
 }
 
 
-def _generate_user_token(username, role):
+def _generate_user_token(username, role, version=None):
     """Generate a signed token for a user."""
     expires = int(time.time()) + _USER_AUTH_TOKEN_EXPIRY
-    payload = "%s:%s:%d" % (username, role, expires)
+    if version is None:
+        user = _find_user(username) or {"username": username, "role": role}
+        version = _token_version(user)
+    payload = "%s:%s:%d:%s" % (username, role, expires, version)
     sig = hmac.new(_USER_AUTH_SECRET, payload.encode("utf-8"),
                    hashlib.sha256).hexdigest()[:32]
     token = base64.urlsafe_b64encode(
@@ -1829,8 +2291,15 @@ def _validate_user_token(token):
                                 hashlib.sha256).hexdigest()[:32]
         if not hmac.compare_digest(provided_sig, expected_sig):
             return None, None
-        username, role, expires_str = payload.split(":")
+        username, role, expires_str, version = payload.split(":")
         if int(expires_str) < int(time.time()):
+            return None, None
+        # Bind the token to the current credentials: deleting the user or
+        # changing their role/password invalidates outstanding tokens.
+        user = _find_user(username)
+        if not user or not hmac.compare_digest(version, _token_version(user)):
+            return None, None
+        if user.get("role", "viewer") != role:
             return None, None
         return username, role
     except Exception:
@@ -1844,8 +2313,11 @@ def _check_user_auth(required_perm="read"):
     with _config_lock:
         users = _config.get("users", [])
         auth_enabled = _config.get("auth_enabled", False)
-    if not auth_enabled or not users:
-        return ("admin", "admin")
+    if not auth_enabled:
+        return ("admin", "admin")  # Auth explicitly disabled = open access
+    if not users:
+        # Auth is on but every account is gone: fail closed.
+        abort(401)
 
     token = None
     auth_header = request.headers.get("Authorization", "")
@@ -1903,6 +2375,55 @@ def syslog_udp_listener(port=514, buf_size=8192):
     log.info("Syslog UDP listener stopped")
 
 
+# RFC 6587 gives two framings for syslog over TCP:
+#   octet counting:      "<len> <msg>"   (length prefix, no delimiter)
+#   non-transparent:     "<msg>\n"      (LF delimited)
+# Both are parsed properly below: a length prefix is honoured exactly, so
+# length-prefixed messages are never merged with the next one or delayed until
+# an arbitrary buffer size is reached.
+_TCP_MAX_FRAME = 1024 * 1024  # 1 MiB hard cap per message
+
+
+def extract_frames(buf, max_frame=_TCP_MAX_FRAME):
+    """Split a TCP buffer into complete messages.
+
+    Returns (messages, remainder). Incomplete trailing data stays in the
+    remainder for the next recv().
+    """
+    messages = []
+    while buf:
+        # Octet counting: leading ASCII digits followed by a single space.
+        match = re.match(rb"^(\d{1,10}) ", buf)
+        if match:
+            length = int(match.group(1))
+            header = match.end()
+            if length > max_frame:
+                log.warning("Oversized syslog frame (%d bytes) -- dropping", length)
+                buf = buf[header + length:] if len(buf) >= header + length else b""
+                continue
+            if len(buf) - header < length:
+                break  # frame not fully received yet
+            messages.append(buf[header:header + length].strip())
+            buf = buf[header + length:]
+            # A sender may still put a delimiter between frames.
+            buf = buf.lstrip(b"\r\n")
+            continue
+        # Non-transparent framing: LF delimited.
+        if b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if line:
+                messages.append(line)
+            continue
+        if len(buf) > max_frame:
+            log.warning("Unframed syslog data exceeded %d bytes -- flushing",
+                        max_frame)
+            messages.append(buf.strip())
+            buf = b""
+        break
+    return [m for m in messages if m], buf
+
+
 def _handle_tcp_client(client_sock, addr):
     """Handle a single TCP syslog client connection."""
     source_ip = addr[0]
@@ -1915,18 +2436,9 @@ def _handle_tcp_client(client_sock, addr):
                 if not data:
                     break
                 buf += data
-                # Split on newlines (syslog over TCP uses LF as delimiter)
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if line:
-                        parsed = parse_syslog_message(line, source_ip)
-                        ingest_log(parsed)
-                # Also handle messages without trailing newline (octet counting)
-                if len(buf) > 8192:
-                    parsed = parse_syslog_message(buf, source_ip)
-                    ingest_log(parsed)
-                    buf = b""
+                messages, buf = extract_frames(buf)
+                for message in messages:
+                    ingest_log(parse_syslog_message(message, source_ip))
             except socket.timeout:
                 continue
             except Exception as e:
@@ -1934,10 +2446,9 @@ def _handle_tcp_client(client_sock, addr):
                     log.debug("TCP client %s error: %s", addr, e)
                 break
     finally:
-        # Flush remaining buffer
+        # A final partial message without a delimiter is still ingested.
         if buf.strip():
-            parsed = parse_syslog_message(buf.strip(), source_ip)
-            ingest_log(parsed)
+            ingest_log(parse_syslog_message(buf.strip(), source_ip))
         client_sock.close()
 
 
@@ -1979,30 +2490,283 @@ def syslog_tcp_listener(port=514):
 # ---------------------------------------------------------------------------
 # Log Retention / Cleanup
 # ---------------------------------------------------------------------------
+# Retention for every growing table, not just logs. Ages are in days and are
+# clipped by the tier's maximum log retention.
+AGE_RETENTION_TABLES = (
+    ("logs", "received_at", "retention_days"),
+    ("alerts", "timestamp", "retention_days"),
+    ("notification_log", "sent_at", "notification_retention_days"),
+    ("correlation_incidents", "created_at", "incident_retention_days"),
+    ("compliance_reports", "created_at", "report_retention_days"),
+)
+_SIZE_CLEANUP_CHUNK = 20000
+_SIZE_CLEANUP_TARGET = 0.9  # trim down to 90% of the limit
+# Hard stop on one enforcement pass, so a mis-set limit or a bad size reading
+# can never walk the whole table in a single run.
+_SIZE_CLEANUP_MAX_ROWS = 2000000
+# Under disk pressure, reclaim filesystem space after this many delete chunks.
+# Deleting alone frees nothing on disk, so the loop has to VACUUM as it goes or
+# it can never observe the free space it is trying to create.
+_DISK_RECLAIM_EVERY_CHUNKS = 1
+# Minimum free-space gain that counts as progress for one reclaim attempt.
+_DISK_RECLAIM_MIN_PROGRESS_MB = 0.01
+_MIN_FREE_DISK_MB = 256
+
+
+def database_size_mb():
+    """Size of the database including WAL/shm sidecars, in MiB."""
+    total = 0
+    for path in (DB_PATH, Path(str(DB_PATH) + "-wal"), Path(str(DB_PATH) + "-shm")):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total / (1024.0 * 1024.0)
+
+
+def reusable_db_mb():
+    """MiB already freed inside the database file but not yet given back.
+
+    SQLite keeps pages emptied by DELETE on a freelist and only returns them to
+    the filesystem on VACUUM, so the file size does not move while a cleanup
+    loop deletes. Counting the freelist is what makes "how big is this database
+    really" answerable mid-cleanup.
+    """
+    try:
+        conn = get_db()
+    except Exception:
+        return 0.0
+    try:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return (int(page_size) * int(free_pages)) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def effective_db_size_mb():
+    """How much space the data actually occupies, in MiB.
+
+    Measured from page accounting (pages in use x page size) rather than the
+    file size, because neither part of the file responds to a DELETE promptly:
+    the main database only shrinks on VACUUM, and the WAL *grows* as pages are
+    modified. Comparing either against the limit makes a cleanup loop delete
+    everything it is allowed to delete. Falls back to the file size if the
+    pragmas are unavailable.
+    """
+    try:
+        conn = get_db()
+    except Exception:
+        return database_size_mb()
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        used = max(0, page_count - free_pages)
+        return (used * page_size) / (1024.0 * 1024.0)
+    except Exception:
+        return database_size_mb()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def reclaim_disk_space(conn=None):
+    """Return freed database pages to the filesystem. Returns MiB reclaimed.
+
+    Truncates the WAL first (it can be larger than the data it describes after
+    a bulk delete) and then VACUUMs. Without this, a delete loop watching free
+    disk space sees no improvement no matter how much it deletes.
+    """
+    before = database_size_mb()
+    own = conn is None
+    if own:
+        try:
+            conn = get_db()
+        except Exception:
+            return 0.0
+    try:
+        conn.execute("VACUUM")
+        # VACUUM rewrites the database *through the WAL*, so the WAL holds a
+        # second copy until it is checkpointed. Truncating afterwards is what
+        # actually hands the space back to the filesystem; skipping it leaves
+        # the file temporarily larger than before the VACUUM.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            log.debug("WAL checkpoint skipped: %s", exc)
+    except sqlite3.Error as exc:
+        log.debug("VACUUM skipped: %s", exc)
+        return 0.0
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return max(0.0, before - database_size_mb())
+
+
+def free_disk_mb():
+    try:
+        usage = shutil.disk_usage(str(DB_PATH.parent))
+        return usage.free / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def _table_exists(conn, table):
+    try:
+        return bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone())
+    except sqlite3.Error:
+        return False
+
+
 def cleanup_old_logs():
-    """Remove logs older than retention period."""
+    """Age-based retention across every growing table."""
     features = get_tier_features()
     max_days = features.get("max_log_retention_days", 30)
     with _config_lock:
-        cfg_days = _config.get("storage", {}).get("retention_days", 30)
-    retention_days = min(cfg_days, max_days)
+        storage = dict(_config.get("storage", {}) or {})
+    default_days = min(int(storage.get("retention_days", 30) or 30), max_days)
 
-    cutoff = (
-        datetime.datetime.now() - datetime.timedelta(days=retention_days)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
+    deleted_total = 0
     try:
         conn = get_db()
-        c = conn.cursor()
-        c.execute("DELETE FROM logs WHERE received_at < ?", (cutoff,))
-        deleted = c.rowcount
-        c.execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
+        cursor = conn.cursor()
+        for table, column, cfg_key in AGE_RETENTION_TABLES:
+            if not _table_exists(conn, table):
+                continue
+            days = int(storage.get(cfg_key, default_days) or default_days)
+            days = min(days, max_days) if table in ("logs", "alerts") else days
+            cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)
+                      ).strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute("DELETE FROM %s WHERE %s < ?" % (table, column),
+                               (cutoff,))
+                if table == "logs":
+                    deleted_total += cursor.rowcount
+            except sqlite3.Error as exc:
+                log.debug("Retention skipped for %s: %s", table, exc)
         conn.commit()
         conn.close()
-        if deleted > 0:
-            log.info("Cleanup: removed %d logs older than %d days", deleted, retention_days)
+        if deleted_total > 0:
+            log.info("Cleanup: removed %d logs older than %d days",
+                     deleted_total, default_days)
     except Exception as e:
         log.error("Cleanup error: %s", e)
+    enforce_storage_limit()
+    return deleted_total
+
+
+def enforce_storage_limit(max_mb=None):
+    """Make max_db_size_mb real: trim oldest logs until the db fits.
+
+    Deletes in bounded chunks so a huge database cannot lock everything up, and
+    stops at min_retention_hours so a tight limit cannot wipe recent evidence.
+    """
+    with _config_lock:
+        storage = dict(_config.get("storage", {}) or {})
+    limit = float(max_mb if max_mb is not None
+                  else storage.get("max_db_size_mb", 0) or 0)
+    min_keep_hours = float(storage.get("min_retention_hours", 1) or 1)
+    if limit <= 0:
+        return {"enforced": False, "reason": "no_limit"}
+
+    size = effective_db_size_mb()
+    free = free_disk_mb()
+    disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
+    if size <= limit and not disk_pressure:
+        return {"enforced": False, "size_mb": round(size, 2),
+                "limit_mb": limit, "free_disk_mb": None if free is None else round(free, 1)}
+    if disk_pressure:
+        log.warning("Low free disk (%.0f MiB) -- trimming logs early", free)
+
+    target = limit * _SIZE_CLEANUP_TARGET
+    floor_ts = (datetime.datetime.now()
+                - datetime.timedelta(hours=min_keep_hours)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+    removed = 0
+    chunks_since_reclaim = 0
+    last_free = free
+    conn = get_db()
+    try:
+        while True:
+            # Effective size, not file size: pages freed by the DELETEs below
+            # stay allocated until the VACUUM after this loop, so measuring the
+            # file would keep the loop deleting until nothing is left above the
+            # retention floor.
+            size = effective_db_size_mb()
+            if size <= target and not disk_pressure:
+                break
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM logs WHERE id IN ("
+                "  SELECT id FROM logs WHERE received_at < ?"
+                "  ORDER BY id ASC LIMIT ?)", (floor_ts, _SIZE_CLEANUP_CHUNK))
+            chunk = cursor.rowcount
+            conn.commit()
+            if chunk <= 0:
+                log.warning("Storage limit %.0f MiB exceeded (%.1f MiB) but "
+                            "everything left is newer than %s hours -- raise "
+                            "max_db_size_mb or lower min_retention_hours",
+                            limit, size, min_keep_hours)
+                break
+            removed += chunk
+            if removed >= _SIZE_CLEANUP_MAX_ROWS:
+                log.warning("Storage cleanup stopped after %d rows in one pass "
+                            "-- will continue on the next cycle", removed)
+                break
+            if disk_pressure:
+                # Deleting rows does not give the filesystem anything back, so
+                # free space cannot improve until the freed pages are reclaimed.
+                # Reclaim, then re-measure -- and if a reclaim buys nothing, the
+                # shortage is not ours to fix by deleting history, so stop.
+                chunks_since_reclaim += 1
+                if chunks_since_reclaim >= _DISK_RECLAIM_EVERY_CHUNKS:
+                    chunks_since_reclaim = 0
+                    reclaimed = reclaim_disk_space(conn)
+                    free = free_disk_mb()
+                    disk_pressure = free is not None and free < _MIN_FREE_DISK_MB
+                    if disk_pressure:
+                        gained = (None if (free is None or last_free is None)
+                                  else free - last_free)
+                        if (reclaimed <= 0.0 and
+                                (gained is None or
+                                 gained < _DISK_RECLAIM_MIN_PROGRESS_MB)):
+                            log.warning(
+                                "Low disk (%s MiB free) is not improving after "
+                                "reclaiming space and removing %d logs -- "
+                                "stopping cleanup; free space is needed "
+                                "elsewhere on the volume",
+                                "unknown" if free is None else "%.0f" % free,
+                                removed)
+                            break
+                        last_free = free
+        if removed:
+            reclaim_disk_space(conn)
+            log.info("Storage limit: removed %d oldest logs (now %.1f MiB of "
+                     "%.0f MiB)", removed, database_size_mb(), limit)
+    except Exception as exc:
+        log.error("Storage limit enforcement failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return {"enforced": True, "removed": removed,
+            "size_mb": round(database_size_mb(), 2),
+            "effective_size_mb": round(effective_db_size_mb(), 2),
+            "limit_mb": limit}
 
 
 def cleanup_loop():
@@ -4261,14 +5025,159 @@ def delete_backup(filename):
 # ---------------------------------------------------------------------------
 # Flask Dashboard & API
 # ---------------------------------------------------------------------------
+# Endpoints reachable without a token: the dashboard shell, static files,
+# login/logout and the ingestion endpoints that authenticate with their own
+# API keys / webhook tokens.
+_AUTH_EXEMPT_ENDPOINTS = {
+    "static",
+    "dashboard",
+    "index",
+    "api_auth_login",
+    "api_auth_logout",
+}
+
+# Endpoints that carry their own credential (a webhook token in the URL) and
+# must stay reachable for log shippers even when dashboard auth is on.
+_SELF_AUTHENTICATED_ENDPOINTS = {
+    "api_security_webhook",
+}
+
+_ENDPOINT_PERMS = {
+    "api_auth_me": "read",
+    "api_get_config": "config",
+    "api_update_config": "config",
+    "api_license": "read",
+    "api_activate_license": "config",
+    "api_backup": "config",
+    "api_restore": "config",
+}
+
+# Endpoints decorated with @optional_api_auth: reachable with a scoped API key
+# as well as a dashboard token. Keep in sync with the decorator usage below.
+_API_KEY_ENDPOINTS = {
+    "api_backup_list",
+    "api_backup_create",
+    "api_backup_download",
+    "api_backup_restore",
+    "api_backup_delete",
+}
+
+# API-key permission levels, widest last.
+_API_KEY_PERMS = {
+    "read": {"read"},
+    "write": {"read", "write"},
+    "admin": {"read", "write", "config"},
+}
+
+
+def _api_key_has_perm(row, required):
+    """Whether an API key row satisfies the permission a route requires."""
+    level = str((row or {}).get("permissions", "read") or "read").lower()
+    return required in _API_KEY_PERMS.get(level, {"read"})
+
+
+_SECRET_CONFIG_KEYS = ("password", "secret", "token", "api_key", "apikey")
+
+
+def _required_perm_for(endpoint, method):
+    """Map a Flask endpoint + method onto a required permission."""
+    if endpoint in _ENDPOINT_PERMS:
+        return _ENDPOINT_PERMS[endpoint]
+    name = endpoint or ""
+    if "user" in name:
+        return "users"
+    if endpoint == "api_ingest_health":
+        return "read"
+    for token in ("config", "setting", "license", "backup", "restore",
+                  "api_key", "apikey", "connector", "channel", "forward",
+                  "retention", "secret"):
+        if token in name:
+            return "config"
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return "read"
+    return "write"
+
+
+def redact_config(cfg):
+    """Deep copy of a config dict with credential-ish values masked."""
+    if isinstance(cfg, dict):
+        out = {}
+        for key, value in cfg.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in _SECRET_CONFIG_KEYS):
+                out[key] = "" if not value else "__set__"
+            else:
+                out[key] = redact_config(value)
+        return out
+    if isinstance(cfg, list):
+        return [redact_config(item) for item in cfg]
+    return cfg
+
+
 if HAS_FLASK:
     app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+
+    @app.before_request
+    def _enforce_authorization():
+        """Central authorization gate.
+
+        Protected by default: a route has to be listed in
+        _AUTH_EXEMPT_ENDPOINTS (or be self-authenticating ingestion) to be
+        reachable without a dashboard token.
+
+        Routes that carry @optional_api_auth are also reachable with a valid
+        API key, so turning dashboard auth on does not lock out existing
+        machine clients. The key still has to pass the same permission check a
+        dashboard user would -- it is not a way around authorization.
+        """
+        endpoint = request.endpoint
+        if endpoint is None or endpoint in _AUTH_EXEMPT_ENDPOINTS:
+            return None
+        if endpoint in _SELF_AUTHENTICATED_ENDPOINTS:
+            return None
+        required = _required_perm_for(endpoint, request.method)
+        if endpoint in _API_KEY_ENDPOINTS:
+            # API keys carry their own read/write/admin scale; a plain read key
+            # must keep working for GETs it could always reach.
+            key_required = ("read" if request.method in ("GET", "HEAD", "OPTIONS")
+                            else "config")
+            presented = (request.headers.get("X-API-Key", "")
+                         or request.args.get("api_key", ""))
+            if presented:
+                row = validate_api_key(presented)
+                if not row:
+                    return jsonify({
+                        "error": "invalid_api_key",
+                        "message": "Invalid or expired API key.",
+                    }), 401
+                if not _api_key_has_perm(row, key_required):
+                    return jsonify({
+                        "error": "insufficient_permissions",
+                        "message": "This API key cannot perform this action.",
+                    }), 403
+                # The route's own @optional_api_auth re-validates and applies
+                # rate limiting; this gate only decides reachability.
+                return None
+        _check_user_auth(required)
+        return None
 
     @app.route("/")
     def dashboard():
         return render_template("sentrylog.html")
 
     # ---- Stats ----
+    @app.route("/api/ingest-health")
+    def api_ingest_health():
+        """Queue depth, ingestion lag, spool and dropped-event counters."""
+        health = get_ingest_health()
+        health["database_mb"] = round(database_size_mb(), 2)
+        with _config_lock:
+            health["database_limit_mb"] = (
+                _config.get("storage", {}) or {}).get("max_db_size_mb", 0)
+        free = free_disk_mb()
+        health["free_disk_mb"] = None if free is None else round(free, 1)
+        return jsonify(health)
+
     @app.route("/api/stats")
     def api_stats():
         hours = request.args.get("hours", 24, type=int)
@@ -4572,7 +5481,7 @@ if HAS_FLASK:
             safe["dashboard"] = _config.get("dashboard", {})
             safe["netmon_integration"] = _config.get("netmon_integration", {})
             safe["auth_enabled"] = _config.get("auth_enabled", False)
-        return jsonify(safe)
+        return jsonify(redact_config(safe))
 
     @app.route("/api/config", methods=["PUT"])
     def api_update_config():
@@ -4582,9 +5491,24 @@ if HAS_FLASK:
                 if key in data:
                     if key not in _config:
                         _config[key] = {}
-                    _config[key].update(data[key])
+                    incoming = {k: v for k, v in (data[key] or {}).items()
+                                if v != "__set__"}  # redaction placeholder
+                    _config[key].update(incoming)
             if "auth_enabled" in data:
-                _config["auth_enabled"] = bool(data["auth_enabled"])
+                want = bool(data["auth_enabled"])
+                if want:
+                    admins = [u for u in _config.get("users", []) or []
+                              if isinstance(u, dict)
+                              and u.get("role") == "admin"
+                              and u.get("password_hash")]
+                    if not admins:
+                        return jsonify({
+                            "error": "no_admin_user",
+                            "message": "Create an admin user before enabling "
+                                       "authentication, or you will lock "
+                                       "yourself out.",
+                        }), 400
+                _config["auth_enabled"] = want
         save_config(_config)
         return jsonify({"status": "ok"})
 
@@ -4599,9 +5523,11 @@ if HAS_FLASK:
         with _config_lock:
             users = _config.get("users", [])
         for u in users:
-            if u.get("username") == username and u.get("password") == password:
+            if u.get("username") != username:
+                continue
+            if verify_password(password, u.get("password_hash", "")):
                 role = u.get("role", "viewer")
-                token = _generate_user_token(username, role)
+                token = _generate_user_token(username, role, _token_version(u))
                 resp = jsonify({"token": token, "username": username,
                                 "role": role,
                                 "expires_in": _USER_AUTH_TOKEN_EXPIRY})
@@ -4642,13 +5568,19 @@ if HAS_FLASK:
             return jsonify({"error": "Username and password required"}), 400
         if role not in USER_AUTH_ROLES:
             return jsonify({"error": "Invalid role"}), 400
+        if not _USERNAME_RE.match(username):
+            return jsonify({"error": "Username may only contain letters, "
+                                     "digits and . _ @ -"}), 400
+        if len(password) < 8:
+            return jsonify({"error": "Password must be at least 8 characters"}), 400
         with _config_lock:
             users = _config.get("users", [])
             for u in users:
                 if u["username"] == username:
                     return jsonify({"error": "User already exists"}), 409
             users.append({"username": username,
-                          "password": password, "role": role})
+                          "password_hash": hash_password(password),
+                          "role": role})
             _config["users"] = users
             save_config(_config)
         return jsonify({"status": "created",
@@ -4670,7 +5602,11 @@ if HAS_FLASK:
                     if new_role:
                         u["role"] = new_role
                     if new_password:
-                        u["password"] = new_password
+                        if len(new_password) < 8:
+                            return jsonify({"error": "Password must be at "
+                                                     "least 8 characters"}), 400
+                        u["password_hash"] = hash_password(new_password)
+                        u.pop("password", None)
                     found = True
                     break
             if not found:
@@ -4683,8 +5619,18 @@ if HAS_FLASK:
         _check_user_auth("users")
         with _config_lock:
             users = _config.get("users", [])
-            _config["users"] = [u for u in users
-                                if u["username"] != username]
+            remaining = [u for u in users if u.get("username") != username]
+            if len(remaining) == len(users):
+                return jsonify({"error": "User not found"}), 404
+            if _config.get("auth_enabled") and not [
+                    u for u in remaining
+                    if isinstance(u, dict) and u.get("role") == "admin"]:
+                return jsonify({
+                    "error": "last_admin",
+                    "message": "Cannot delete the last admin while "
+                               "authentication is enabled.",
+                }), 409
+            _config["users"] = remaining
             save_config(_config)
         return jsonify({"status": "deleted"})
 
@@ -6436,10 +7382,13 @@ def main():
         t.start()
         threads.append(t)
 
-    # Start buffer flush loop
-    t = threading.Thread(target=_buffer_flush_loop, daemon=True)
-    t.start()
-    threads.append(t)
+    # Re-attempt anything spooled by a previous run *before* the replay loop
+    # exists, so there is only ever one replay owner at a time.
+    recover_claimed_spool_files()
+    replayed = replay_spool()
+    start_ingest_workers()
+    if replayed:
+        log.info("Replayed %d events spooled by a previous run", replayed)
 
     # Start cleanup loop
     t = threading.Thread(target=cleanup_loop, daemon=True)
