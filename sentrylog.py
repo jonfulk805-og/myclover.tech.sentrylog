@@ -5484,7 +5484,7 @@ if HAS_FLASK:
 
     @app.route("/")
     def dashboard():
-        return render_template("sentrylog.html")
+        return render_template("sentrylog.html", version=VERSION)
 
     # ---- Stats ----
     @app.route("/api/ingest-health")
