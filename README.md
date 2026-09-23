@@ -131,6 +131,44 @@ See **[SETUP_UBUNTU.md](SETUP_UBUNTU.md)** for the complete step-by-step deploym
 
 ---
 
+## Incident Timeline (NetMon integration)
+
+The **Incident Timeline** tab merges NetMon device state changes with SentryLog
+messages from the same host onto a single clock, so an outage reads as a story
+instead of two tools you have to diff by hand.
+
+```yaml
+netmon_integration:
+  enabled: true
+  netmon_url: "http://netmon.internal:8080"
+  read_token: "same-value-as-netmon-integration-read-token"
+  timeout_seconds: 5
+  verify_tls: true
+```
+
+Enter a NetMon device name (or a raw source IP) and pick a window. If you give a
+device name, its IP addresses are learned from NetMon's events, so you do not have
+to know them.
+
+**`GET /api/timeline`** — `hours` (or `from`/`to`), `device`, `host`, `severity`,
+`limit`. Returns `items` sorted oldest first, each tagged `kind: device | log`,
+plus `device_events`, `log_events`, `truncated` (set if *either* side hit a limit),
+`netmon_truncated`, and `netmon_error`.
+
+Times: SentryLog stores logs in server-local time and NetMon speaks UTC, so the
+timeline sorts on real instants, never on strings. Each item carries `timestamp`
+(UTC, `Z`) and `local_time` (server-local, what the tab shows). `from`/`to`
+without an offset mean server-local time; `host` restricts both sides.
+
+Two deliberate behaviours:
+
+- **If NetMon is unreachable, the timeline still renders the logs** and reports the
+  reason in `netmon_error`, shown in the UI. A timeline that looks quiet because
+  the integration is broken is worse than an error message.
+- **A device with no known host matches no logs**, rather than falling back to
+  every source. An incident timeline quietly padded with unrelated hosts is
+  actively misleading.
+
 ## Architecture
 
 ```
