@@ -77,3 +77,10 @@ compliance:
 netmon_integration:
   enabled: false
   netmon_url: "http://localhost:8080"
+  # Shared secret. Must match `integration.read_token` in NetMon's config.yaml.
+  # Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+  # NetMon accepts it on /api/integration/events only, and only for reads.
+  read_token: ""
+  timeout_seconds: 5
+  # Set to false only for an internal NetMon with a self-signed certificate.
+  verify_tls: true

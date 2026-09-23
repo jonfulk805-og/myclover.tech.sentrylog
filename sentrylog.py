@@ -49,6 +49,10 @@ import secrets
 import functools
 import base64
 import queue as queue_mod
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -104,7 +108,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -417,6 +421,9 @@ def _default_config():
         "netmon_integration": {
             "enabled": False,
             "netmon_url": "http://localhost:8080",
+            "read_token": "",
+            "timeout_seconds": 5,
+            "verify_tls": True,
         },
         "notifications": {
             "email_enabled": False,
@@ -5114,6 +5121,320 @@ def redact_config(cfg):
     return cfg
 
 
+# --- Shared incident timeline --------------------------------------------
+# NetMon knows when a device changed state; SentryLog knows what the device was
+# saying at the time. Neither answers "what happened" on its own, so the
+# timeline interleaves both on one clock.
+
+_TIMELINE_MAX_EVENTS = 2000
+_TIMELINE_DEFAULT_HOURS = 6
+
+
+def _as_bool_cfg(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _netmon_settings():
+    with _config_lock:
+        return dict(_config.get("netmon_integration", {}) or {})
+
+
+# --- Timeline time contract ------------------------------------------------
+# SentryLog stores received_at as *local* naive "YYYY-MM-DD HH:MM:SS"; NetMon
+# emits timezone-aware UTC ("...Z"). The timeline never compares those as
+# strings: every item is converted to an aware instant, sorted on that, and
+# emitted as canonical UTC ("timestamp") plus server-local wall time
+# ("local_time") for display. Naive user-supplied bounds mean server-local
+# time, consistent with the rest of SentryLog; bounds with an offset are
+# honoured. NetMon is always sent UTC bounds.
+
+def _parse_instant(value, naive_tz="local"):
+    """ISO-8601 -> aware datetime. naive_tz is "local" or "utc".
+
+    Returns None for empty input and raises ValueError for garbage.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        if naive_tz == "utc":
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone()  # naive -> server local zone
+    return dt
+
+
+def _utc_wire(dt):
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utc_iso(dt):
+    return dt.astimezone(datetime.timezone.utc).replace(
+        tzinfo=None).isoformat() + "Z"
+
+
+def _local_db(dt):
+    """Aware instant -> the local naive format SentryLog stores."""
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fetch_netmon_feed(start=None, end=None, device=None, host=None, limit=500,
+                      settings=None):
+    """Read device events from NetMon.
+
+    Returns a dict: events, error, truncated (NetMon's own flag), device_hosts
+    (device name -> host for requested devices NetMon knows, even when they had
+    no transitions). start/end are aware datetimes or ISO strings; they are
+    always sent to NetMon as UTC.
+
+    Never raises: NetMon being down or misconfigured must degrade the timeline
+    to logs-only rather than break the page. The error is returned so the UI can
+    say so out loud instead of implying the devices were quiet.
+    """
+    out = {"events": [], "error": "", "truncated": False, "device_hosts": {}}
+    cfg = settings if settings is not None else _netmon_settings()
+    if not _as_bool_cfg(cfg.get("enabled", False)):
+        out["error"] = "netmon_integration is disabled"
+        return out
+    base = str(cfg.get("netmon_url", "") or "").rstrip("/")
+    if not base:
+        out["error"] = "netmon_url is not configured"
+        return out
+
+    params = {"limit": int(limit)}
+    try:
+        start_dt = _parse_instant(start)
+        end_dt = _parse_instant(end)
+    except (TypeError, ValueError):
+        out["error"] = "could not parse the timeline window"
+        return out
+    if start_dt:
+        params["from"] = _utc_wire(start_dt)
+    if end_dt:
+        params["to"] = _utc_wire(end_dt)
+    if device:
+        params["device"] = device
+    if host:
+        params["host"] = host
+    url = base + "/api/integration/events?" + urllib.parse.urlencode(params)
+
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    token = str(cfg.get("read_token", "") or "")
+    if token:
+        req.add_header("X-Netmon-Integration-Token", token)
+    try:
+        timeout = float(cfg.get("timeout_seconds", 5) or 5)
+    except (TypeError, ValueError):
+        timeout = 5.0
+
+    kwargs = {"timeout": timeout}
+    if url.lower().startswith("https://") and not _as_bool_cfg(
+            cfg.get("verify_tls", True)):
+        # Opt-in only, for an internal NetMon with a self-signed certificate.
+        kwargs["context"] = ssl._create_unverified_context()
+    try:
+        with urllib.request.urlopen(req, **kwargs) as resp:
+            payload = json_mod.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            out["error"] = ("NetMon refused the integration token (HTTP %d) -- "
+                            "check integration.read_token on both sides"
+                            % exc.code)
+        else:
+            out["error"] = "NetMon returned HTTP %d" % exc.code
+        return out
+    except Exception as exc:
+        out["error"] = "NetMon unreachable: %s" % exc
+        return out
+
+    if not isinstance(payload, dict):
+        out["error"] = "NetMon returned an unexpected payload"
+        return out
+    events = payload.get("events")
+    if not isinstance(events, list):
+        out["error"] = "NetMon returned no event list"
+        return out
+    out["events"] = events
+    out["truncated"] = bool(payload.get("truncated", False))
+    dh = payload.get("device_hosts")
+    if isinstance(dh, dict):
+        out["device_hosts"] = {str(k): str(v) for k, v in dh.items() if v}
+    return out
+
+
+def fetch_netmon_events(start=None, end=None, device=None, limit=500,
+                        settings=None):
+    """Backward-compatible wrapper: (events, error_message)."""
+    feed = fetch_netmon_feed(start=start, end=end, device=device, limit=limit,
+                             settings=settings)
+    return feed["events"], feed["error"]
+
+
+def build_timeline(hours=_TIMELINE_DEFAULT_HOURS, device=None, host=None,
+                   start=None, end=None, limit=_TIMELINE_MAX_EVENTS,
+                   severity=None):
+    """Interleave NetMon device events and SentryLog messages on one clock.
+
+    device filters the NetMon side by name; its hosts come from NetMon
+    (device_hosts, then event hosts), so the caller does not need the IP. An
+    explicit host is a *restriction* on both sides, never a union.
+
+    Raises ValueError for an unparseable start/end.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _TIMELINE_MAX_EVENTS
+    limit = max(1, min(limit, _TIMELINE_MAX_EVENTS))
+
+    now = datetime.datetime.now().astimezone()
+    end_dt = _parse_instant(end) or now
+    start_dt = _parse_instant(start)
+    if start_dt is None:
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            hours = _TIMELINE_DEFAULT_HOURS
+        hours = max(0.1, min(hours, 24 * 31))
+        start_dt = end_dt - datetime.timedelta(hours=hours)
+    host = str(host).strip() if host else ""
+
+    feed = fetch_netmon_feed(start=start_dt, end=end_dt, device=device,
+                             host=host or None, limit=limit)
+    netmon_error = feed["error"]
+
+    events = [ev for ev in feed["events"] if isinstance(ev, dict)]
+    if host:
+        # Defensive: an older NetMon ignores ?host=, so enforce it here too.
+        events = [ev for ev in events if str(ev.get("host", "")) == host]
+        hosts = {host}
+    else:
+        hosts = set(feed["device_hosts"].values())
+        for ev in events:
+            if ev.get("host"):
+                hosts.add(str(ev["host"]))
+
+    items = []
+    skipped = 0
+    for ev in events:
+        try:
+            instant = _parse_instant(ev.get("timestamp"), naive_tz="utc")
+        except (TypeError, ValueError):
+            instant = None
+        if instant is None:
+            skipped += 1
+            continue
+        items.append({
+            "kind": "device",
+            "_instant": instant,
+            "device": ev.get("device", ""),
+            "host": ev.get("host", ""),
+            "status": ev.get("status", ""),
+            "previous_status": ev.get("previous_status", ""),
+            "label": ev.get("check_label") or ev.get("check_type") or "",
+            "event_type": ev.get("type", "state_change"),
+            "message": ev.get("message", ""),
+        })
+
+    where = ["received_at >= ?", "received_at <= ?"]
+    params = [_local_db(start_dt), _local_db(end_dt)]
+    run_log_query = True
+    if hosts:
+        ors = " OR ".join(["source_ip = ? OR source_name = ?"] * len(hosts))
+        where.append("(%s)" % ors)
+        for h in sorted(hosts):
+            params.extend([h, h])
+    elif device:
+        # A device was asked for and NetMon knows no host for it (or NetMon is
+        # unreachable). Matching nothing is correct: matching everything would
+        # fill an incident timeline with logs from unrelated hosts.
+        run_log_query = False
+    if severity:
+        sevs = [x.strip().lower() for x in str(severity).split(",") if x.strip()]
+        if sevs:
+            where.append("severity IN (%s)" % ",".join(["?"] * len(sevs)))
+            params.extend(sevs)
+
+    rows = []
+    if run_log_query:
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT received_at, timestamp, source_ip, source_name, severity,"
+                " facility, app_name, message FROM logs WHERE %s"
+                # limit + 1 so truncation can be reported honestly.
+                " ORDER BY received_at DESC, id DESC LIMIT ?"
+                % " AND ".join(where), params + [limit + 1]).fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    logs_truncated = len(rows) > limit
+
+    for row in rows:
+        try:
+            instant = _parse_instant(row["received_at"], naive_tz="local")
+        except (TypeError, ValueError):
+            instant = None
+        if instant is None:
+            skipped += 1
+            continue
+        items.append({
+            "kind": "log",
+            "_instant": instant,
+            "device": row["source_name"] or row["source_ip"] or "",
+            "host": row["source_ip"] or "",
+            "status": row["severity"] or "",
+            "previous_status": "",
+            "label": row["app_name"] or row["facility"] or "",
+            "event_type": "log",
+            "message": row["message"] or "",
+        })
+
+    # Sort on parsed instants: device and log timestamps are in different zones
+    # and formats, so string order is meaningless across the two.
+    items.sort(key=lambda i: (i["_instant"], 0 if i["kind"] == "device" else 1))
+    merged_truncated = len(items) > limit
+    if merged_truncated:
+        # Newest wins: an incident is read backwards from the symptom.
+        items = items[-limit:]
+    for it in items:
+        instant = it.pop("_instant")
+        it["timestamp"] = _utc_iso(instant)
+        it["local_time"] = instant.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    netmon_truncated = bool(feed["truncated"])
+    return {
+        "from": _local_db(start_dt),
+        "to": _local_db(end_dt),
+        "from_utc": _utc_wire(start_dt),
+        "to_utc": _utc_wire(end_dt),
+        "device": device or "",
+        "hosts": sorted(hosts),
+        "items": items,
+        "count": len(items),
+        "truncated": merged_truncated or logs_truncated or netmon_truncated,
+        "netmon_truncated": netmon_truncated,
+        "skipped_unparseable": skipped,
+        "device_events": sum(1 for i in items if i["kind"] == "device"),
+        "log_events": sum(1 for i in items if i["kind"] == "log"),
+        "netmon_error": netmon_error,
+    }
+
+
 if HAS_FLASK:
     app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
 
@@ -5163,7 +5484,7 @@ if HAS_FLASK:
 
     @app.route("/")
     def dashboard():
-        return render_template("sentrylog.html")
+        return render_template("sentrylog.html", version=VERSION)
 
     # ---- Stats ----
     @app.route("/api/ingest-health")
@@ -5177,6 +5498,21 @@ if HAS_FLASK:
         free = free_disk_mb()
         health["free_disk_mb"] = None if free is None else round(free, 1)
         return jsonify(health)
+
+    @app.route("/api/timeline")
+    def api_timeline():
+        """Device events and logs interleaved for one incident window."""
+        try:
+            return jsonify(build_timeline(
+                hours=request.args.get("hours", _TIMELINE_DEFAULT_HOURS),
+                device=request.args.get("device") or None,
+                host=request.args.get("host") or None,
+                start=request.args.get("from") or None,
+                end=request.args.get("to") or None,
+                severity=request.args.get("severity") or None,
+                limit=request.args.get("limit", _TIMELINE_MAX_EVENTS)))
+        except ValueError:
+            return jsonify({"error": "from/to must be ISO-8601 timestamps"}), 400
 
     @app.route("/api/stats")
     def api_stats():
