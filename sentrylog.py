@@ -2178,19 +2178,41 @@ _PBKDF2_ROUNDS = 200000
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 
+# SHA-256 of signing secrets that were published (committed to the public
+# repo by mistake). An install that picked one up -- e.g. a git checkout run
+# with DATA_DIR = the repo folder -- regenerates instead of trusting it.
+_REVOKED_SECRET_SHA256 = frozenset({
+    # auth_secret.key committed in 5d57551 (2026-09-23), removed 2026-10-01
+    "3c508d38e69ceeab14d0a1acdcde5a127de164bd154b4b6cca028d943f8c81b7",
+})
+
+
+def _secret_is_revoked(data):
+    return hashlib.sha256(data).hexdigest() in _REVOKED_SECRET_SHA256
+
+
 def _load_or_create_secret():
     """Per-installation token signing secret, persisted in the data dir.
 
     Never hard-coded: a fixed secret in public source lets anyone mint an
-    admin token. SENTRYLOG_AUTH_SECRET overrides.
+    admin token. SENTRYLOG_AUTH_SECRET overrides. Known-leaked secrets are
+    replaced with a fresh one (existing sessions are logged out once).
     """
     env = os.environ.get("SENTRYLOG_AUTH_SECRET", "").strip()
     if env:
-        return env.encode("utf-8")
+        if _secret_is_revoked(env.encode("utf-8")):
+            log.error("SENTRYLOG_AUTH_SECRET is a publicly leaked value -- "
+                      "ignoring it; set a new random secret")
+        else:
+            return env.encode("utf-8")
     try:
         if SECRET_PATH.exists():
             data = SECRET_PATH.read_bytes().strip()
-            if len(data) >= 32:
+            if _secret_is_revoked(data):
+                log.warning("Auth secret at %s was published in the public repo "
+                            "-- rotating it (everyone must log in again)",
+                            SECRET_PATH)
+            elif len(data) >= 32:
                 return data
         secret = secrets.token_hex(32).encode("ascii")
         SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)

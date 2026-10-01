@@ -1,5 +1,23 @@
 # Upgrading SentryLog
 
+## auth_secret.key removed from git (October 2026)
+
+A test run wrote `auth_secret.key` into the repo folder and it was committed
+by mistake in `5d57551` (2026-09-23). That file signs dashboard login tokens.
+It is now untracked and gitignored, and its value is on a revocation list:
+any install that loads it throws it away and generates a new one. Everyone gets
+logged out once.
+
+- **Docker / NAS:** the image never copied that file, and the container
+  uses `/app/data/auth_secret.key`, so the leaked value should not be in use.
+  To rotate anyway: stop the container, delete `auth_secret.key` from the
+  mounted data folder, start it again.
+- **Run from a git checkout:** `git pull` deletes the file and SentryLog
+  makes a new one when it starts.
+- If you set `SENTRYLOG_AUTH_SECRET`, it is unaffected unless it is the
+  leaked value (in that case it is ignored and an error is logged).
+
+
 Two changes land together: the **hardening release** (persistence,
 authorization, durable ingestion, safe storage cleanup) and the **Incident
 Timeline** tab, which reads device events from NetMon. Both are below.

@@ -34,3 +34,11 @@ sentrylog_config.local.yaml
 # Backups (local only, not tracked in git)
 backups/
 *.pre_restore
+
+# Secrets -- per-install token signing key is generated at runtime, never commit
+auth_secret.key
+*.key
+*.pem
+
+# Runtime spool (ingest overflow)
+spool/
